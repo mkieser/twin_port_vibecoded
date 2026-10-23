@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Port Operations Twin</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/cesium@1.146.0/Build/Cesium/Widgets/widgets.css">
+<link rel="stylesheet" href="style.css">
+<script src="https://cdn.jsdelivr.net/npm/cesium@1.146.0/Build/Cesium/Cesium.js"></script>
+</head>
+<body>
+<div id="viewer"></div>
+
+<nav id="tabs" role="tablist" aria-label="Panels">
+  <button role="tab" id="tab-live" aria-controls="panel-live" aria-selected="true">Live</button>
+  <button role="tab" id="tab-replay" aria-controls="panel-replay" aria-selected="false">Replay</button>
+  <button role="tab" id="tab-flood" aria-controls="panel-flood" aria-selected="false">Flood</button>
+</nav>
+
+<aside class="panel" id="panel-live" role="tabpanel" aria-labelledby="tab-live">
+  <section class="card tide" aria-live="polite">
+    <h2>Tide · Halifax <span class="muted" id="tide-station"></span></h2>
+    <div class="hero">
+      <span id="tide-level">–</span><span class="unit">m</span>
+      <span class="trend" id="tide-trend" aria-label=""></span>
+    </div>
+    <div class="muted" id="tide-detail">waiting for the tide feed…</div>
+  </section>
+  <section class="card">
+    <h2>Vessels</h2>
+    <div class="status" id="vessels-status" data-state="connecting">connecting…</div>
+    <div class="muted"><span id="vessel-count">0</span> in the extent · updated <span id="vessels-updated">–</span></div>
+    <ul class="legend" id="type-legend"></ul>
+    <ul class="legend">
+      <li><svg width="14" height="14" viewBox="-7 -7 14 14" aria-hidden="true"><path d="M0,-6 L4.5,5 L0,2.5 L-4.5,5 Z" fill="var(--ink-2)"/></svg>pointing along heading</li>
+      <li><svg width="14" height="14" viewBox="-7 -7 14 14" aria-hidden="true"><circle r="4" fill="var(--ink-2)"/></svg>heading not reported</li>
+    </ul>
+  </section>
+</aside>
+
+<aside class="panel" id="panel-replay" role="tabpanel" aria-labelledby="tab-replay" hidden>
+  <section class="card">
+    <h2>Berth occupancy · past week</h2>
+    <div class="hero small" id="replay-date">–</div>
+    <div class="muted" id="replay-detail">loading…</div>
+    <div class="slider-row">
+      <button id="replay-play" class="icon-button" aria-label="Play">▶</button>
+      <input type="range" id="replay-slider" min="0" max="6" step="1" value="6" aria-label="Day">
+    </div>
+    <div class="ticks" id="replay-ticks"></div>
+  </section>
+  <section class="card">
+    <h2>Dwell time</h2>
+    <div class="ramp" aria-hidden="true"></div>
+    <div class="ramp-ticks"><span>0 h</span><span>6</span><span>12</span><span>18</span><span>24 h</span></div>
+    <div class="muted">Clock hours a vessel spent moored in the berth that day. Hover a circle for details.</div>
+  </section>
+</aside>
+
+<aside class="panel" id="panel-flood" role="tabpanel" aria-labelledby="tab-flood" hidden>
+  <section class="card">
+    <h2>Water plane</h2>
+    <div class="hero"><span id="water-level">–</span><span class="unit">m CD</span></div>
+    <div class="muted" id="water-detail">waiting for the tide feed…</div>
+    <label class="slider-label" for="water-slider">Height above the current tide
+      <output id="water-offset" for="water-slider">+0.0 m</output></label>
+    <input type="range" id="water-slider" min="-2" max="6" step="0.1" value="0">
+    <div class="ramp-ticks"><span>−2 m</span><span>0</span><span>+2</span><span>+4</span><span>+6 m</span></div>
+    <button id="water-reset" class="text-button">Back to the current tide</button>
+    <ul class="legend">
+      <li><span class="swatch" style="background: var(--building)"></span>building</li>
+      <li><span class="swatch" style="background: var(--flooded)"></span>ground at or below the water</li>
+    </ul>
+  </section>
+  <section class="card" aria-live="polite">
+    <h2>Storm surge</h2>
+    <div class="hero small" id="surge-headline">–</div>
+    <div class="muted" id="surge-detail">waiting for the storm surge feed…</div>
+    <div class="note">The MSC coastal flooding risk index gives risk levels where storm
+      surge drives flooding, not surge heights.</div>
+  </section>
+</aside>
+
+<div id="tooltip" role="tooltip" hidden></div>
+<script src="app.js"></script>
+</body>
+</html>

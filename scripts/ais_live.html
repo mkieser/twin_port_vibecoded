@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live Vessels</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<style>
+  :root {
+    --moving: #d9480f;
+    --stationary: #1c7ed6;
+    --panel-bg: rgba(255, 255, 255, 0.94);
+    --text: #212529;
+    --muted: #6c757d;
+  }
+  html, body { margin: 0; height: 100%; font: 13px/1.4 system-ui, sans-serif; color: var(--text); }
+  #map { position: absolute; inset: 0; }
+  #panel {
+    position: absolute; top: 10px; right: 10px; z-index: 1000; min-width: 190px;
+    padding: 10px 12px; border-radius: 6px; background: var(--panel-bg);
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+  }
+  #panel h1 { margin: 0 0 6px; font-size: 14px; }
+  #status::before { content: "●"; margin-right: 5px; color: var(--muted); }
+  #status.live::before { color: #2f9e44; }
+  #status.down::before { color: #e03131; }
+  .row { color: var(--muted); }
+  .key { display: inline-flex; align-items: center; gap: 5px; margin-right: 10px; }
+  .vessel svg { overflow: visible; }
+  .leaflet-tooltip b { font-size: 13px; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="panel">
+  <h1>Live vessels</h1>
+  <div id="status">connecting…</div>
+  <div class="row"><span id="count">0</span> vessels · updated <span id="updated">–</span></div>
+  <div class="row" style="margin-top: 6px">
+    <span class="key"><svg width="12" height="12" viewBox="-6 -6 12 12"><path d="M0,-6 L4.5,5 L0,2.5 L-4.5,5 Z" fill="var(--moving)"/></svg>moving</span>
+    <span class="key"><svg width="12" height="12" viewBox="-6 -6 12 12"><circle r="4.5" fill="var(--stationary)"/></svg>stationary</span>
+  </div>
+</div>
+<script>
+// Project extent (extent.gpkg) in lon/lat, for the initial view
+const EXTENT = [[44.6116, -63.6311], [44.7023, -63.5041]];
+const MOVING_SOG = 1.0;  // kn, matches MOORED_SOG in ais_consumer.py
+const NAV_STATUS = ["Under way using engine", "At anchor", "Not under command",
+  "Restricted manoeuvrability", "Constrained by draught", "Moored", "Aground",
+  "Engaged in fishing", "Under way sailing"];
+
+const map = L.map("map").fitBounds(EXTENT);
+L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  maxZoom: 19,
+  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+}).addTo(map);
+L.rectangle(EXTENT, { color: "#495057", weight: 1, dashArray: "4 4", fill: false }).addTo(map);
+
+const markers = new Map();  // mmsi -> L.marker
+
+function icon(p) {
+  const moving = p.sog !== null && p.sog >= MOVING_SOG;
+  const bearing = p.heading ?? p.cog;
+  const shape = moving && bearing !== null
+    ? `<path d="M0,-9 L6,7 L0,3.5 L-6,7 Z" transform="rotate(${bearing})"
+             fill="var(--moving)" stroke="#fff" stroke-width="1.2"/>`
+    : `<circle r="5" fill="${moving ? "var(--moving)" : "var(--stationary)"}"
+               stroke="#fff" stroke-width="1.2"/>`;
+  return L.divIcon({ className: "vessel", iconSize: [20, 20],
+    html: `<svg width="20" height="20" viewBox="-10 -10 20 20">${shape}</svg>` });
+}
+
+function fmt(value, unit) {
+  return value === null ? "–" : `${value}${unit}`;
+}
+
+function tooltip(p) {
+  const age = Math.round((Date.now() - Date.parse(p.ts)) / 60000);
+  return `<b>${p.ship_name ?? "Unknown"}</b><br>
+    MMSI ${p.mmsi}<br>
+    ${NAV_STATUS[p.nav_status] ?? "Status not reported"}<br>
+    SOG ${fmt(p.sog, " kn")} · COG ${fmt(p.cog, "°")} · HDG ${fmt(p.heading, "°")}<br>
+    <span style="color: var(--muted)">reported ${age < 1 ? "just now" : age + " min ago"}</span>`;
+}
+
+function update(collection) {
+  const seen = new Set();
+  for (const f of collection.features) {
+    const p = f.properties;
+    const [lon, lat] = f.geometry.coordinates;
+    seen.add(p.mmsi);
+    let marker = markers.get(p.mmsi);
+    if (!marker) {
+      marker = L.marker([lat, lon]).addTo(map);
+      markers.set(p.mmsi, marker);
+    }
+    marker.setLatLng([lat, lon]).setIcon(icon(p)).bindTooltip(tooltip(p));
+  }
+  for (const [mmsi, marker] of markers) {
+    if (!seen.has(mmsi)) { marker.remove(); markers.delete(mmsi); }
+  }
+  document.getElementById("count").textContent = markers.size;
+  document.getElementById("updated").textContent = new Date().toLocaleTimeString();
+}
+
+function setStatus(text, cls) {
+  const el = document.getElementById("status");
+  el.textContent = text;
+  el.className = cls;
+}
+
+// Connect back to the server that served this page; reconnect with backoff
+let retryMs = 1000;
+function connect() {
+  const ws = new WebSocket(`ws://${location.host || "localhost:8765"}`);
+  ws.onopen = () => { setStatus("live", "live"); retryMs = 1000; };
+  ws.onmessage = (e) => update(JSON.parse(e.data));
+  ws.onclose = () => {
+    setStatus(`disconnected, retrying in ${retryMs / 1000} s`, "down");
+    setTimeout(connect, retryMs);
+    retryMs = Math.min(retryMs * 2, 30000);
+  };
+}
+connect();
+</script>
+</body>
+</html>
