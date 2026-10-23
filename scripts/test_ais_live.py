@@ -4,8 +4,6 @@ import os
 import socket
 import tempfile
 import unittest
-import urllib.error
-import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -86,30 +84,6 @@ class TestLivePositions(unittest.TestCase):
         self.assertEqual(feature["properties"]["ship_name"], "ASTERIX")
         self.assertEqual([f["properties"]["ship_type"] for f in snapshot["features"]], [70, None])
         self.assertEqual(feature["properties"]["ts"], "2026-10-21T12:00:30.500000Z")
-
-    def test_map_page_over_http(self):
-        port = free_port()
-
-        def get(path):
-            try:
-                with urllib.request.urlopen(f"http://localhost:{port}{path}", timeout=2) as r:
-                    return r.status, r.headers["Content-Type"], r.read().decode()
-            except urllib.error.HTTPError as exc:
-                return exc.code, None, None
-
-        async def run():
-            server = asyncio.create_task(serve_live_positions(
-                "localhost", port, self.positions_dir, poll_seconds=0.05))
-            await asyncio.sleep(0.3)
-            try:
-                return await asyncio.to_thread(get, "/"), await asyncio.to_thread(get, "/favicon.ico")
-            finally:
-                server.cancel()
-
-        (status, content_type, body), (missing, _, _) = asyncio.run(run())
-        self.assertEqual((status, content_type), (200, "text/html; charset=utf-8"))
-        self.assertIn("new WebSocket", body)
-        self.assertEqual(missing, 404)
 
 
 if __name__ == "__main__":

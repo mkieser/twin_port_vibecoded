@@ -3,19 +3,18 @@ Push live vessel positions to browsers over a websocket.
 
   Input    the most recent files in DATA_DIR/ais/positions (from ais_consumer.py)
   Output   ws://HOST:PORT, one GeoJSON FeatureCollection per new file
-  Map      http://HOST:PORT serves ais_live.html, a Leaflet map of the vessels
 
 The positions folder is polled every POLL_SECONDS. When a newer .parquet file
 appears (the consumer writes one per flush), it and every file written up to
 WINDOW_SECONDS before it are read, so moored ships that report only every few
-minutes stay on the map. Each vessel's latest position across those files is
+minutes stay in the feed. Each vessel's latest position across those files is
 broadcast to every connected browser as a GeoJSON FeatureCollection: Point
 geometry in lon/lat, properties mmsi, ship_name, ship_type, ts (ISO 8601 UTC),
 sog, cog, heading and nav_status. ship_type is the AIS type code from
-DATA_DIR/ais/vessels.parquet, null until the vessel's static data has arrived. A browser that connects gets the current positions
-straight away, then each update.
+DATA_DIR/ais/vessels.parquet, null until the vessel's static data has arrived.
+A browser that connects gets the current positions straight away, then each
+update. The twin app (twin_app.py) shows them on its Live panel.
 
-Open http://localhost:8765 for the map. Any other plain HTTP request gets a 404.
 To use the feed elsewhere, e.g. in Cesium:
   const ws = new WebSocket("ws://localhost:8765");
   ws.onmessage = async (e) => {
@@ -29,8 +28,6 @@ Needs duckdb and websockets (pip install duckdb websockets).
 import asyncio
 import json
 import logging
-from http import HTTPStatus
-from pathlib import Path
 
 import duckdb
 from websockets.asyncio.server import broadcast, serve
@@ -41,7 +38,6 @@ HOST = "localhost"
 PORT = 8765
 POLL_SECONDS = 5
 WINDOW_SECONDS = 600   # files this much older than the newest are still read
-MAP_PAGE = Path(__file__).with_name("ais_live.html")
 
 log = logging.getLogger("ais_live")
 
@@ -82,18 +78,6 @@ def positions_geojson(con, paths, vessels_path=VESSELS_PATH):
         for *props, lon, lat in rows]}
 
 
-def serve_map_page(connection, request):
-    """Answer plain HTTP requests (no websocket upgrade) with the map page or a 404."""
-    if request.headers.get("Upgrade", "").lower() == "websocket":
-        return None
-    if request.path.split("?")[0] != "/":
-        return connection.respond(HTTPStatus.NOT_FOUND, "Not found\n")
-    response = connection.respond(HTTPStatus.OK, MAP_PAGE.read_text())  # reread, so edits show
-    del response.headers["Content-Type"]
-    response.headers["Content-Type"] = "text/html; charset=utf-8"
-    return response
-
-
 async def serve_live_positions(host=HOST, port=PORT, positions_dir=POSITIONS_DIR,
                                poll_seconds=POLL_SECONDS, vessels_path=None):
     """Serve ws://host:port, pushing the recent positions files' vessels to every browser.
@@ -111,9 +95,8 @@ async def serve_live_positions(host=HOST, port=PORT, positions_dir=POSITIONS_DIR
             await ws.send(current["message"])
         await ws.wait_closed()
 
-    async with serve(handler, host, port, process_request=serve_map_page) as server:
-        log.info("serving live positions on ws://%s:%d, map on http://%s:%d",
-                 host, port, host, port)
+    async with serve(handler, host, port) as server:
+        log.info("serving live positions on ws://%s:%d", host, port)
         while True:
             paths = recent_files(positions_dir)
             if paths and paths[0] != current["file"]:
