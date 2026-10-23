@@ -12,8 +12,8 @@ index, topo-bathymetric terrain and 3D buildings in a CesiumJS app with three pa
   raises and lowers the water, and buildings whose ground is at or below it turn red. The panel
   also shows the current storm surge flooding risk.
 
-Almost all of the code was written by Claude Code from the prompts below, with the decisions it
-made along the way recorded under [Decisions](#decisions).
+Almost all of the code was written by Claude and Claude Code from the prompts below, with the
+decisions made along the way recorded under [Decisions](#decisions).
 
 ## Contents
 
@@ -240,10 +240,155 @@ reference:
 
 ## How it was built
 
-The raster loading and merging, terrain export, building extrusion and 3D Tiles export, and the
-original AIS consumer and live feed were built before the session recorded here, so their prompts
-aren't included. The rest was built in one Claude Code session (Claude Opus 5.5, October 2026)
-from these prompts:
+The project started in a Claude.ai chat that wrote the raster loader, and was then built in
+three Claude Code sessions (Claude Opus 5.5, October 2026): terrain and buildings, then the AIS
+services, then the remaining services and the app.
+
+### Claude.ai: loading the rasters
+
+`load_rasters.py` was started in the Claude.ai web app, with these prompts:
+
+1. > Write Python code that loads the dtm_proj.tif and nonna10_proj.tif GeoTIFF data.
+
+   Result: `load_rasters.py`. It reads both rasters as masked NumPy arrays, with NoData cells
+   masked out, and keeps their georeferencing (EPSG:2961, 10 m grid). It uses rasterio when
+   available and falls back to Pillow + NumPy otherwise. It prints a summary of each raster and
+   checks that the two share the same grid. The 10 m `dtm_proj.tif` was later replaced by the 1 m
+   DTM (see session 1, prompt 5).
+
+2. > Set the NONNA-10 NoData to -32767.
+
+   The first attempt wrote a converted copy of the GeoTIFF, which wasn't wanted, so the request
+   was clarified:
+
+   > No, I don't want that. In the load_rasters.py code add a line that adjusts the NONNA-10
+   > NoData value to -32767 which is the same as the DTM.
+
+   Result: a `set_nodata()` method on the `Raster` class, called on load. It changes NONNA-10's
+   NoData from -9999 to -32767 in memory and leaves the source file unchanged.
+
+3. > The vertical datum for the NONNA-10 is the local Chart Datum and DTM is in CGVD2013. The
+   > NONNA-10 data needs to be adjusted +1.44 m so it will also be in CGVD2013.
+
+   Result: the constant `CD_TO_CGVD2013 = 1.44`, applied to valid NONNA-10 cells on load, so the
+   bathymetry and the DTM share the same vertical datum (CGVD2013). The offset was later corrected
+   to −1.41 m (see session 3, prompt 4).
+
+### Session 1: terrain and buildings
+
+1. > Write a test that the difference between the original NONNA-10 data and the adjusted
+   > NONNA-10 data is 1.44m
+
+   Result: the datum shift moved into `adjust_nonna()`, plus `test_load_rasters.py`. The shift
+   was later corrected to −1.41 m (see session 3, prompt 4).
+
+2. > change the data path prefix in the load_rasters.py to "/Users/michaelkieser/projects/3d_port/"
+
+   Result: `DATA_DIR`, which every other script now imports.
+
+3. > merge the dtm and nonna10 together as one raster
+
+   Result: `merge_rasters()` and `write_raster()`, writing `dtm_nonna10_merged.tif`.
+
+4. > can you output the merged raster as a COG and Cesium quantized-mesh terrain
+
+   Result: `export_terrain.py`.
+
+5. > Substitute the 10 meter resolution NONNA10_proj.tif image with the 1 meter resolution
+   > dtm_1m_utm20_w_4_94.tif
+
+   Claude Code pointed out that the 1 m file is a land DTM with no bathymetry, and asked whether
+   it should replace the 10 m DTM instead. The answer was yes.
+
+   Result: the 1 m DTM replaced `dtm_proj.tif`, NONNA-10 is resampled onto the 1 m grid
+   (`resample_to()`), and the terrain goes to level 16.
+
+6. > Yes, prior to writing the data in Cesium, adjust it to the WGS84 ellipsoid, but lowering it
+   > by 20.270 m, then write it as a Cesium quantized-mesh terrain.
+
+   Result: `CGVD2013_TO_WGS84 = -20.270` in `export_terrain.py`, applied to the terrain tiles only.
+
+7. > Read the /Users/michaelkieser/projects/3d_port/building_proj.gpkg file in, and convert the
+   > building polygons into 3D shapes using the elevmin attribute as the bottom of the buildings
+   > and the heightmax attribute as the top of the buildings.
+
+   Result: `extrude_buildings.py`, writing `building_3d.gpkg`.
+
+8. > Yes, lower the buildings by the same 20.27 m and export the buildings as Cesium 3D Tiles.
+
+   Result: `export_buildings_3dtiles.py`, checked with Cesium's `3d-tiles-validator`
+   (0 errors, 0 warnings).
+
+9. > Can you summarize the prompts in this Claude Code tab so I can include them in a README.md
+
+   Result: this section, and the terrain and buildings decisions below.
+
+### Session 2: AIS positions and berth analysis
+
+1. > For my Port and Coastal Operations Twin, I want to build a small service that turns raw AIS
+   > positions into port operations signals. I'll need a Python websocket consumer that filters
+   > the AIS data to the project extent (/Users/michaelkieser/projects/3d_port/extent.gpkg) and
+   > stores the positions as GeoParquet with DuckDB.
+
+   Result: `ais_consumer.py` and `test_ais_consumer.py`. No AIS feed was named, so Claude Code
+   used aisstream.io.
+
+2. > Can you write a function within the ais_consumer that merges each day's files into one and
+   > saves it in a separate folder.
+
+   Result: `compact_day()` and the `--compact [YYYY-MM-DD]` option, writing
+   `DATA_DIR/ais/positions_daily/`.
+
+3. > Can you write a analyze_day function that would run after the compact_day function. The
+   > function analyzes each days positions.parquet file and determines the berth it occupied by
+   > name, the dwell time in whole hours that day the vessel occupied the berth, and the average
+   > x and y coordinates while in the berth. The polygon berth data, with a "name" attribute, is
+   > here /Users/michaelkieser/projects/3d_port/berth.gpkg. Store the "mmsi", "ship_name",
+   > "berth_name", "dwell_time", "x" and "y" in a daily analysis.parquet file.
+
+   Result: `analyze_day()`, writing `DATA_DIR/ais/analysis_daily/`; `--compact` now runs both.
+   Claude Code found that one berth (AYC) was invisible to DuckDB because it was an unsaved edit
+   in QGIS; it appeared once QGIS saved the file.
+
+4. > Change the PositionStore to store the original lon/lat coordinates as EPSG:4326 rather than
+   > x/y. Also change the analyze_day so the coordinates are stored as lon/lat coordinates.
+
+   Result: positions and the analysis store `lon`/`lat`, and the geometry is labelled EPSG:4326.
+   Claude Code asked what to do with the 58 files already written with x/y; the answer was to
+   leave them.
+
+5. > Can you write a function that can push live vessel positions from the most recent .parquet
+   > file to a browser over a websocket?
+
+   Result: `ais_live.py` and `test_ais_live.py`, sending each vessel's latest position as GeoJSON.
+
+6. > Yes, read the last few files instead of one, to catch those moored ships that report every
+   > 3 minutes.
+
+   Result: the feed reads the last 10 minutes of files, which took the map from 6 to 45 vessels.
+
+7. > I have deleted all the .parquet files that had x/y coordinates, so you don't have to worry
+   > about them anymore.
+
+   Result: the code for reading old and new files together was removed.
+
+8. > what does this mean "INFO connection rejected (426 Upgrade Required)"
+
+   Answer: a plain HTTP request, such as opening the websocket address in the browser's address
+   bar, reached the websocket server.
+
+9. > Yes, create a small HTML page that connects and plots the vessels on a map.
+
+   Result: `ais_live.html`, a Leaflet map served at http://localhost:8765 by `ais_live.py`. It
+   was later removed in favour of the app's Live panel (see session 3, prompt 6).
+
+10. > And lastely, can you summarize the prompts in this Claude Code tab so I can include them
+    > in a README.md
+
+    Result: this section, the Claude.ai section above (from a summary of that chat), and the AIS
+    decisions below.
+
+### Session 3: services and app
 
 1. > For my Port and Coastal Operations Twin, I want to build a service that stores the current
    > tide level using the CHS IWLS API. I'll need a Python websocket consumer that pulls the tide
@@ -307,6 +452,50 @@ from these prompts:
 
 These are the choices Claude Code made where the request and the data didn't line up, or where
 there was more than one reasonable approach.
+
+**Terrain and buildings**
+
+- **Bathymetry wins where both have data.** Over water the DTM is a flat surface at about −0.75 m,
+  so NONNA-10 is used wherever it has data and the DTM everywhere else. About 4% of the overlap
+  is above 0 m in the DTM, along the shoreline.
+- **Bilinear upsampling of NONNA-10.** Resampling the 10 m bathymetry bilinearly onto the 1 m grid
+  avoids 10 m blocks, without growing its footprint.
+- **Level 16 terrain.** At 256 cells per tile, level 16 puts mesh points about 1 m apart,
+  matching the DTM. Each tile's mesh is simplified to within 0.5 m at level 16, and the allowed
+  error doubles at each coarser level.
+- **Constant geoid offset.** CGVD2013 heights are shifted to the ellipsoid by a single −20.27 m
+  rather than by the CGG2013 geoid model, which would vary slightly across the 10 km square.
+  The COG keeps CGVD2013 heights.
+- **0 m outside the extent.** Terrain tiles that reach past the 10 km square are filled with 0 m
+  CGVD2013, which leaves a cliff at the edges.
+- **`heightmax` is a height above ground.** `heightmax` averages 7.9 m and `elevmin` 46 m, so
+  using `heightmax` as the roof elevation would put 30,129 of 31,389 roofs below their bases.
+  Buildings run from `elevmin` to `elevmin + heightmax`. One building with a height of 0 or less
+  is dropped.
+- **1 km tiles with pickable buildings.** The 3D Tiles are grouped on a 1 km grid, 110 tiles in
+  all. Each building carries its attributes in the tile, so it can be clicked in Cesium.
+
+**AIS**
+
+- **aisstream.io.** No feed was named, so the consumer uses aisstream.io, the common free AIS
+  websocket feed. Only the subscription and message parsing would change for another provider.
+- **Two-step extent filter.** The subscription asks for the extent's lon/lat bounding box, padded
+  by 0.01°, and each batch is then clipped exactly to the extent polygon in EPSG:2961.
+- **"Not available" values as NULL.** AIS codes for missing data (speed 102.3, course 360,
+  heading 511, rate of turn −128) are stored as NULL.
+- **Flush files, merged daily.** Positions are written every 60 s, about 1,440 small files a day.
+  `compact_day` merges each day into one file sorted by vessel and time. It keeps the originals
+  and writes through a temporary file, so readers never see a half-written file.
+- **Occupying a berth means stationary.** Some berth polygons are large (South End is about
+  44 ha), so a position counts only if the vessel is under 1 kn or reports no speed. Otherwise
+  passing tugs and ferries would count.
+- **Dwell time as clock hours.** Dwell time is the number of UTC clock hours in which the vessel
+  was seen in the berth (0–24). This avoids counting the gap between two separate visits as time
+  at the berth.
+- **Analysis in its own folder.** Analysis files go in `analysis_daily/`, not next to
+  `positions.parquet`, so a `**/*.parquet` read of positions never picks them up.
+- **Geometry column found by type.** GeoPackages name the geometry column differently (`geom` in
+  `extent.gpkg`, `geometry` in `berth.gpkg`), so `analyze_day` finds it by type.
 
 **Tide**
 
