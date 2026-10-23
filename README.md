@@ -122,6 +122,8 @@ ion token is needed. Open a panel directly with `?tab=live`, `?tab=replay` or `?
 
 ### Live
 
+![Live panel: vessels in Halifax Harbour as arrows coloured by ship type, with the tide card showing 0.48 m and falling](images/live.png)
+
 - **Vessels:** each vessel's latest position from the last 10 minutes of AIS files, updated as
   the consumer writes new files. The icon points along the reported heading, or the course over
   ground while the vessel is moving. Vessels with neither show as a circle.
@@ -135,6 +137,8 @@ ion token is needed. Open a panel directly with `?tab=live`, `?tab=replay` or `?
 
 ### Replay
 
+![Replay panel: berth stays on Thursday 22 October as circles coloured green to orange by dwell time, with the day slider and dwell time legend](images/replay.png)
+
 - One circle per vessel and berth for each of the past 7 days, at the vessel's mean position in
   the berth.
 - The colour runs from green (short stay) to red (24 hours) on a fixed 0–24 hour scale.
@@ -143,6 +147,8 @@ ion token is needed. Open a panel directly with `?tab=live`, `?tab=replay` or `?
   analysis file show as not analysed.
 
 ### Flood
+
+![Flood panel: 3D view of downtown Halifax with the water plane raised 1.6 m above the tide, waterfront buildings at or below the water in red](images/flood.png)
 
 - **Scene:** topo-bathymetric terrain and 3D buildings, with a translucent water plane over the
   project extent at the current tide level.
