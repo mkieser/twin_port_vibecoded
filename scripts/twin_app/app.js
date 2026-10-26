@@ -94,10 +94,13 @@ const tooltips = new WeakMap();  // entity -> () => html
 
 // --- Feeds ---------------------------------------------------------------------------------
 
-function feed(port, onMessage, onState = () => {}) {
+// All feeds share one port and are told apart by path, e.g. ws://host:8765/tide
+function feed(port, path, onMessage, onState = () => {}) {
   let retryMs = 1000;
   const open = () => {
-    const ws = new WebSocket(`ws://${location.hostname || "localhost"}:${port}`);
+    // wss:// when the page itself came over HTTPS (browsers block ws:// from https pages)
+    const scheme = location.protocol === "https:" ? "wss" : "ws";
+    const ws = new WebSocket(`${scheme}://${location.hostname || "localhost"}:${port}${path}`);
     ws.onopen = () => { retryMs = 1000; onState("live"); };
     ws.onmessage = (e) => onMessage(JSON.parse(e.data));
     ws.onclose = () => {
@@ -109,9 +112,48 @@ function feed(port, onMessage, onState = () => {}) {
   open();
 }
 
-function setStatus(el, state, retryMs) {
+// The ship feed sends what it has as soon as a browser connects, then each new file the
+// consumer writes (about once a minute). No message soon after connecting means nothing has
+// been collected; positions that stop getting newer mean ais_consumer.py has stopped.
+const FIRST_DATA_MS = 10000;
+const VESSELS_STALE_MS = 5 * 60000;
+const vesselFeed = { state: "connecting", retryMs: 0, connectedAt: 0, received: false, newest: null };
+
+function vesselFeedState(state, retryMs) {
+  Object.assign(vesselFeed, { state, retryMs });
+  if (state === "live") {
+    vesselFeed.connectedAt = Date.now();
+    setTimeout(renderVesselStatus, FIRST_DATA_MS);
+  }
+  renderVesselStatus();
+}
+
+function renderVesselStatus() {
+  const f = vesselFeed;
+  let state = "live", text = "live", hint = "";
+  if (f.state === "down") {
+    state = "down";
+    text = "Ship feed not reachable";
+    hint = `Retrying in ${f.retryMs / 1000} s. twin_app.py serves it on port ${config.feed_port}, `
+      + `path ${config.feeds.vessels}.`;
+  } else if (f.state === "connecting") {
+    state = "connecting";
+    text = "connecting…";
+  } else if (!f.received) {
+    const waiting = Date.now() - f.connectedAt < FIRST_DATA_MS;
+    state = waiting ? "connecting" : "down";
+    text = waiting ? "waiting for positions…" : "No ship positions collected yet";
+    hint = waiting ? "" : "Start ais_consumer.py to collect them.";
+  } else if (f.newest !== null && Date.now() - f.newest > VESSELS_STALE_MS) {
+    state = "stale";
+    text = `Newest position ${ago(new Date(f.newest).toISOString())}`;
+    hint = "Showing the last known positions. Is ais_consumer.py running?";
+  }
+  const el = $("vessels-status");
   el.dataset.state = state;
-  el.textContent = state === "live" ? "live" : `disconnected, retrying in ${retryMs / 1000} s`;
+  el.textContent = text;
+  $("vessels-hint").textContent = hint;
+  $("vessels-hint").hidden = !hint;
 }
 
 // --- Live: vessels -------------------------------------------------------------------------
@@ -185,7 +227,12 @@ function updateVessels(collection) {
   entities.resumeEvents();
   renderTypeLegend(counts);
   $("vessel-count").textContent = collection.features.length;
-  $("vessels-updated").textContent = timeFmt.format(new Date());
+  // The newest position report, not when it arrived: the feed replays old files on connect
+  const times = collection.features.map((f) => Date.parse(f.properties.ts)).filter(Number.isFinite);
+  vesselFeed.received = true;
+  if (times.length) vesselFeed.newest = Math.max(...times);
+  $("vessels-updated").textContent = vesselFeed.newest === null ? "–" : timeFmt.format(new Date(vesselFeed.newest));
+  renderVesselStatus();
 }
 
 // --- Live: tide ----------------------------------------------------------------------------
@@ -292,6 +339,7 @@ function togglePlay(play = playTimer === null) {
 let config = null;           // /api/config
 let tileset = null;
 let terrainLoaded = false;
+let buildingsAvailable = true;  // false once the tiles turn out to be missing or broken
 let waterEllipsoidal = null; // water plane height on the WGS84 ellipsoid, as the terrain is
 const groundByBuilding = new Map();  // feature_id -> z_bottom (m CGVD2013), loaded tiles only
 
@@ -314,7 +362,7 @@ function updateWater() {
     + ` · ${w.cgvd.toFixed(2)} m CGVD2013<br>`
     + (groundByBuilding.size
       ? `${flooded.toLocaleString()} of ${groundByBuilding.size.toLocaleString()} loaded buildings at or below the water`
-      : "Buildings loading…");
+      : buildingsAvailable ? "Buildings loading…" : "No buildings to check");
   if (tileset) {
     tileset.style = new Cesium.Cesium3DTileStyle({ color: { conditions: [
       [`\${z_bottom} <= ${w.cgvd.toFixed(3)}`, `color('${css("--flooded")}')`],
@@ -334,11 +382,50 @@ function addWaterPlane() {
   });
 }
 
+const LAYER_HELP = {
+  terrain: "<b>Terrain not built.</b> The globe has no ground heights, so the water plane is not "
+    + "placed against real ground. Run <code>python export_terrain.py</code>, then reload.",
+  buildings: "<b>Buildings not built.</b> Run <code>python fetch_buildings.py</code>, "
+    + "<code>python extrude_buildings.py</code> and <code>python export_buildings_3dtiles.py</code>, "
+    + "then reload.",
+};
+
+function showLayerProblems(problems) {
+  const notice = $("layers-notice");
+  notice.innerHTML = problems.map((p) => `<p>${p}</p>`).join("");
+  notice.hidden = problems.length === 0;
+}
+
+// Terrain and buildings load independently, so one missing doesn't stop the other
 async function loadFloodLayers() {
   if (terrainLoaded) return;
   terrainLoaded = true;
-  viewer.terrainProvider = await Cesium.CesiumTerrainProvider.fromUrl("/terrain/",
-    { requestVertexNormals: true });
+  const problems = [];
+  if (!config.layers.terrain) {
+    problems.push(LAYER_HELP.terrain);
+  } else {
+    try {
+      viewer.terrainProvider = await Cesium.CesiumTerrainProvider.fromUrl("/terrain/",
+        { requestVertexNormals: true });
+    } catch (e) {
+      problems.push(`<b>Terrain could not be loaded:</b> ${escapeHtml(e.message ?? e)}`);
+    }
+  }
+  if (!config.layers.buildings) {
+    problems.push(LAYER_HELP.buildings);
+  } else {
+    try {
+      await loadBuildings();
+    } catch (e) {
+      problems.push(`<b>Buildings could not be loaded:</b> ${escapeHtml(e.message ?? e)}`);
+    }
+  }
+  buildingsAvailable = tileset !== null;
+  showLayerProblems(problems);
+  updateWater();
+}
+
+async function loadBuildings() {
   tileset = await Cesium.Cesium3DTileset.fromUrl("/buildings/tileset.json");
   tileset.outlineColor = Cesium.Color.fromCssColorString("#898781");
   tileset.show = currentTab === "flood";
@@ -351,7 +438,6 @@ async function loadFloodLayers() {
     scheduleWaterUpdate();
   });
   scene.primitives.add(tileset);
-  updateWater();
 }
 
 let waterUpdatePending = false;
@@ -520,9 +606,11 @@ async function start() {
   currentTab = null;
   showTab(tabs.includes(initial) ? initial : "live");
 
-  feed(config.feeds.vessels, updateVessels, (state, retry) => setStatus($("vessels-status"), state, retry));
-  feed(config.feeds.tide, updateTide);
-  feed(config.feeds.storm_surge, updateStormSurge);
+  const port = config.feed_port;
+  feed(port, config.feeds.vessels, updateVessels, vesselFeedState);
+  setInterval(renderVesselStatus, 15000);  // positions go stale without any new message
+  feed(port, config.feeds.tide, updateTide);
+  feed(port, config.feeds.storm_surge, updateStormSurge);
 }
 
 start();

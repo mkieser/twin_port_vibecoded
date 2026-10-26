@@ -6,12 +6,17 @@ and Flood panels, plus the three live websocket feeds it reads.
   Terrain  http://HOST:HTTP_PORT/terrain/...     DATA_DIR/terrain (from export_terrain.py)
   Tiles    http://HOST:HTTP_PORT/buildings/...   DATA_DIR/buildings_3dtiles
                                                   (from export_buildings_3dtiles.py)
-  Config   http://HOST:HTTP_PORT/api/config      extent, datums and feed ports, as JSON
+  Config   http://HOST:HTTP_PORT/api/config      extent, datums, feed port and paths, and
+                                                  which of terrain and buildings exist, as JSON
   Replay   http://HOST:HTTP_PORT/api/replay?days=7   berth occupancy per day, as JSON
-  Feeds    ws://HOST:8765  vessels              ais_live.py, reading DATA_DIR/ais
-           ws://HOST:8766  tide level           tide_live.py, reading DATA_DIR/tide
-           ws://HOST:8767  storm surge risk     storm_surge_live.py, reading
-                                                DATA_DIR/coastal_flooding
+  Feeds    ws://HOST:FEED_PORT/vessels      vessels            ais_live.py, reading DATA_DIR/ais
+           ws://HOST:FEED_PORT/tide         tide level         tide_live.py, reading DATA_DIR/tide
+           ws://HOST:FEED_PORT/storm_surge  storm surge risk   storm_surge_live.py, reading
+                                                               DATA_DIR/coastal_flooding
+
+All three feeds share one websocket port and are told apart by path, so a TLS proxy in
+front of the app (for https:// and wss://) needs just the HTTP port and FEED_PORT. Any
+other path is refused with 404 during the handshake.
 
 The consumers (ais_consumer.py, tide_consumer.py, storm_surge_consumer.py) run
 separately and write the files the feeds read. /api/replay reads the
@@ -46,17 +51,19 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import duckdb
+from websockets.asyncio.server import serve
 
 from ais_consumer import ANALYSIS_DIR, CRS, EXTENT_PATH, VESSELS_PATH
-from ais_live import serve_live_positions
+from ais_live import live_positions
 from load_rasters import CD_TO_CGVD2013, DATA_DIR
-from storm_surge_live import serve_live_storm_surge
+from storm_surge_live import live_storm_surge
 from tide_consumer import STATION_CODE
-from tide_live import serve_live_tide
+from tide_live import live_tide
 
 HOST = "localhost"
 HTTP_PORT = 8000
-FEED_PORTS = {"vessels": 8765, "tide": 8766, "storm_surge": 8767}
+FEED_PORT = 8765
+FEED_PATHS = {"vessels": "/vessels", "tide": "/tide", "storm_surge": "/storm_surge"}
 REPLAY_DAYS = 7
 
 APP_DIR = Path(__file__).with_name("twin_app")
@@ -93,8 +100,9 @@ def extent_bbox(extent_path=EXTENT_PATH):
         con.close()
 
 
-def app_config(bbox):
-    return {"extent": bbox, "station": STATION_CODE, "feeds": FEED_PORTS,
+def app_config(bbox, feed_port=FEED_PORT):
+    return {"extent": bbox, "station": STATION_CODE,
+            "feed_port": feed_port, "feeds": FEED_PATHS,
             "datums": {"chart_datum_cgvd2013": CHART_DATUM_CGVD2013,
                        "cgvd2013_to_wgs84": CGVD2013_TO_WGS84}}
 
@@ -135,7 +143,7 @@ class TwinHandler(SimpleHTTPRequestHandler):
     def do_GET(self):
         url = urlsplit(self.path)
         if url.path == "/api/config":
-            return self.send_json(self.config)
+            return self.send_json({**self.config, "layers": self.layers()})
         if url.path == "/api/replay":
             try:
                 days = min(max(int(parse_qs(url.query).get("days", [REPLAY_DAYS])[0]), 1), 31)
@@ -144,6 +152,11 @@ class TwinHandler(SimpleHTTPRequestHandler):
             today = datetime.now(timezone.utc).date()
             return self.send_json(replay_days(today, days, self.analysis_dir, self.vessels_path))
         return super().do_GET()
+
+    def layers(self):
+        """Whether the terrain and building tiles have been built, checked on every request."""
+        return {"terrain": (self.routes["/terrain/"] / "layer.json").is_file(),
+                "buildings": (self.routes["/buildings/"] / "tileset.json").is_file()}
 
     def send_json(self, data):
         body = json.dumps(data).encode()
@@ -182,15 +195,30 @@ def start_http(host=HOST, port=HTTP_PORT, config=None, app_dir=APP_DIR, terrain_
     return server
 
 
-async def serve_twin(host=HOST, http_port=HTTP_PORT):
-    """Serve the app over HTTP and the three feeds over websockets until cancelled."""
-    server = start_http(host, http_port)
+async def serve_feeds(host, port, feeds):
+    """Serve each (handler, poll) feed in `feeds` at its path on ws://host:port until cancelled."""
+    def process_request(connection, request):
+        if urlsplit(request.path).path not in feeds:
+            return connection.respond(HTTPStatus.NOT_FOUND, "No feed at this path\n")
+
+    async def route(ws):
+        handler, _ = feeds[urlsplit(ws.request.path).path]
+        await handler(ws)
+
+    async with serve(route, host, port, process_request=process_request):
+        log.info("feeds on ws://%s:%d%s", host, port, ", ".join(feeds))
+        await asyncio.gather(*(poll() for _, poll in feeds.values()))
+
+
+async def serve_twin(host=HOST, http_port=HTTP_PORT, feed_port=FEED_PORT):
+    """Serve the app over HTTP and the three feeds over one websocket port until cancelled."""
+    server = start_http(host, http_port, config=app_config(extent_bbox(), feed_port))
     log.info("twin app on http://%s:%d", host, http_port)
+    feeds = {FEED_PATHS["vessels"]: live_positions(),
+             FEED_PATHS["tide"]: live_tide(),
+             FEED_PATHS["storm_surge"]: live_storm_surge()}
     try:
-        await asyncio.gather(
-            serve_live_positions(host, FEED_PORTS["vessels"]),
-            serve_live_tide(host, FEED_PORTS["tide"]),
-            serve_live_storm_surge(host, FEED_PORTS["storm_surge"]))
+        await serve_feeds(host, feed_port, feeds)
     finally:
         server.shutdown()
 
@@ -199,9 +227,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--host", default=HOST)
     parser.add_argument("--port", type=int, default=HTTP_PORT, help="HTTP port for the app")
+    parser.add_argument("--feed-port", type=int, default=FEED_PORT,
+                        help="websocket port for the three feeds")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
-        asyncio.run(serve_twin(args.host, args.port))
+        asyncio.run(serve_twin(args.host, args.port, args.feed_port))
     except KeyboardInterrupt:
         pass

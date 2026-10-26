@@ -108,7 +108,7 @@ class TestPositionStore(unittest.TestCase):
         files = list(self.out_dir.glob("date=2026-10-21/*.parquet"))
         self.assertEqual(len(files), 1)
         geo = duckdb.sql(f"SELECT decode(value) FROM parquet_kv_metadata('{files[0]}') "
-                         "WHERE decode(key) = 'geo'").fetchone()[0]
+                         "WHERE decode(key) = 'geo'").fetchall()[0][0]
         self.assertEqual(json.loads(geo)["primary_column"], "geometry")
 
         rows = read_positions(self.out_dir).fetchall()
@@ -143,7 +143,7 @@ class TestPositionStore(unittest.TestCase):
         merged = duckdb.sql(f"SELECT mmsi FROM read_parquet('{files[0]}')").fetchall()
         self.assertEqual(merged, [(1,), (2,), (3,)])
         geo = duckdb.sql(f"SELECT decode(value) FROM parquet_kv_metadata('{files[0]}') "
-                         "WHERE decode(key) = 'geo'").fetchone()[0]
+                         "WHERE decode(key) = 'geo'").fetchall()[0][0]
         self.assertEqual(json.loads(geo)["primary_column"], "geometry")
         self.assertEqual(read_positions(daily_dir).fetchall(),
                          read_positions(self.out_dir).fetchall())
@@ -210,7 +210,7 @@ class TestAnalyzeDay(unittest.TestCase):
         tmp = Path(self.tmp.name)
         self.daily_dir, self.out_dir = tmp / "daily", tmp / "analysis"
         self.berth_path = tmp / "berth.gpkg"
-        duckdb.sql("INSTALL spatial; LOAD spatial")
+        duckdb.sql("INSTALL spatial; LOAD spatial; SET geometry_always_xy = true")
         duckdb.sql(f"""
             COPY (SELECT * FROM (VALUES
                 ('A', ST_GeomFromText('POLYGON((455000 4945000, 455100 4945000, 455100 4945100, 455000 4945100, 455000 4945000))')),
@@ -258,7 +258,7 @@ class TestAnalyzeDay(unittest.TestCase):
         for row, (*_, x, y) in zip(rows, expected):
             lon, lat = duckdb.sql(f"""
                 SELECT ST_X(p), ST_Y(p) FROM (SELECT ST_Transform(ST_Point({x}, {y}),
-                    'EPSG:2961', 'EPSG:4326', always_xy := true) AS p)""").fetchone()
+                    'EPSG:2961', 'EPSG:4326', always_xy := true) AS p)""").fetchall()[0]
             self.assertAlmostEqual(row[4], lon, places=7)  # ~1 cm
             self.assertAlmostEqual(row[5], lat, places=7)
 

@@ -83,21 +83,25 @@ def latest_tide(con, levels_dir=LEVELS_DIR, station=STATION_CODE):
     return latest
 
 
-async def serve_live_tide(host=HOST, port=PORT, levels_dir=LEVELS_DIR,
-                          poll_seconds=POLL_SECONDS):
-    """Serve ws://host:port, pushing each new tide reading to every browser."""
+def live_tide(levels_dir=LEVELS_DIR, poll_seconds=POLL_SECONDS):
+    """The tide feed as (handler, poll): handler(ws) serves one browser and poll() pushes
+    each new tide reading to every connected browser until cancelled."""
     con = duckdb.connect()
     con.execute("SET TimeZone = 'UTC'")
     current = {"ts": None, "message": None}
+    clients = set()
 
     async def handler(ws):
         log.info("browser connected from %s", ws.remote_address)
-        if current["message"]:
-            await ws.send(current["message"])
-        await ws.wait_closed()
+        clients.add(ws)
+        try:
+            if current["message"]:
+                await ws.send(current["message"])
+            await ws.wait_closed()
+        finally:
+            clients.discard(ws)
 
-    async with serve(handler, host, port) as server:
-        log.info("serving live tide on ws://%s:%d", host, port)
+    async def poll():
         while True:
             try:
                 tide = latest_tide(con, levels_dir)
@@ -106,10 +110,21 @@ async def serve_live_tide(host=HOST, port=PORT, levels_dir=LEVELS_DIR,
             else:
                 if tide and tide["ts"] != current["ts"]:
                     current.update(ts=tide["ts"], message=json.dumps(tide))
-                    broadcast(server.connections, current["message"])
+                    broadcast(clients, current["message"])
                     log.info("pushed %.3f m (%s) at %s to %d browsers", tide["tide_level"],
-                             tide["trend"], tide["ts"], len(server.connections))
+                             tide["trend"], tide["ts"], len(clients))
             await asyncio.sleep(poll_seconds)
+
+    return handler, poll
+
+
+async def serve_live_tide(host=HOST, port=PORT, levels_dir=LEVELS_DIR,
+                          poll_seconds=POLL_SECONDS):
+    """Serve the tide feed on ws://host:port on its own (twin_app.py serves it at /tide)."""
+    handler, poll = live_tide(levels_dir, poll_seconds)
+    async with serve(handler, host, port):
+        log.info("serving live tide on ws://%s:%d", host, port)
+        await poll()
 
 
 if __name__ == "__main__":

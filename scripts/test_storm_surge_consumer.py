@@ -107,7 +107,7 @@ class TestStore(unittest.TestCase):
         self.assertEqual(written.name, "risk_index_20261022T1200Z.parquet")
         self.assertEqual(read_snapshot(written), [("in", 2)])
         (geo,) = duckdb.sql(f"SELECT decode(value) FROM parquet_kv_metadata('{written}') "
-                            "WHERE decode(key) = 'geo'").fetchone()
+                            "WHERE decode(key) = 'geo'").fetchall()[0]
         self.assertEqual(json.loads(geo)["columns"]["geometry"]["geometry_types"], ["Polygon"])
         self.assertEqual(read_latest(self.latest_path), {
             "fetched_at": "2026-10-22T12:00:00Z", "snapshot": written.name,

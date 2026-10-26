@@ -3,3 +3,9 @@ __pycache__/
 .DS_Store
 *.parquet
 *.parquet.tmp
+data/*.tif
+data/*.part
+data/terrain/
+data/buildings_3dtiles/
+data/building_proj.gpkg
+data/building_3d.gpkg

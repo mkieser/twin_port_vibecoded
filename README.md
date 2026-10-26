@@ -5,12 +5,15 @@ It brings together live vessel positions (AIS), the CHS tide level, the MSC coas
 index, topo-bathymetric terrain and 3D buildings in a CesiumJS app with three panels:
 
 - **Live** (2D): vessels as icons pointing along their heading, coloured by ship type, and the
-  current tide level with a rising or falling arrow.
+  current tide level with a rising or falling arrow. The vessels card says when the ship feed
+  can't be reached, when no positions have been collected, or when the newest position is over
+  5 minutes old (usually because `ais_consumer.py` has stopped).
 - **Replay** (2D): berth occupancy for the past week, with a day slider. Circles go from green to
   red as dwell time increases, and hovering shows each vessel's details.
 - **Flood** (3D): terrain and buildings with a water plane at the current tide level. A slider
   raises and lowers the water, and buildings whose ground is at or below it turn red. The panel
-  also shows the current storm surge flooding risk.
+  also shows the current storm surge flooding risk. If the terrain or building tiles haven't
+  been built, a notice at the top of the panel names the scripts to run.
 
 Almost all of the code was written by Claude and Claude Code from the prompts below, with the
 decisions made along the way recorded under [Decisions](#decisions).
@@ -32,6 +35,7 @@ decisions made along the way recorded under [Decisions](#decisions).
 scripts/
   load_rasters.py               load and merge the DTM and NONNA-10 bathymetry
   export_terrain.py             merged raster -> Cloud Optimized GeoTIFF + Cesium terrain tiles
+  fetch_buildings.py            NRCan building footprints for the extent -> building_proj.gpkg
   extrude_buildings.py          building footprints -> 3D solids
   export_buildings_3dtiles.py   3D solids -> Cesium 3D Tiles
   ais_consumer.py               live AIS from aisstream.io -> GeoParquet, plus berth analysis
@@ -47,27 +51,27 @@ scripts/
 
 ## Setup
 
-All data lives outside the repository, in `DATA_DIR`, set at the top of
-[scripts/load_rasters.py](scripts/load_rasters.py) (`/Users/michaelkieser/projects/3d_port/`).
-Change it to your own folder. The inputs it expects are:
+All data lives in the repository's [data/](data/) folder, `DATA_DIR` in
+[scripts/load_rasters.py](scripts/load_rasters.py). Generated outputs are written there too. The
+inputs it expects are:
 
 | File | What it is |
 |---|---|
-| `dtm_1m_utm20_w_4_94.tif` | 1 m lidar DTM, EPSG:2961, CGVD2013 heights |
-| `nonna10_proj.tif` | CHS NONNA-10 bathymetry reprojected to EPSG:2961, chart datum heights |
-| `building_proj.gpkg` | NRCan automatically extracted building footprints with `elevmin` and `heightmax` |
 | `extent.gpkg` | the project extent, a 10 km square polygon in EPSG:2961 |
-| `berth.gpkg` | named berth polygons, for the berth occupancy analysis |
+| `dtm_1m_utm20_w_4_94.tif` | 1 m lidar DTM (NRCan HRDEM), EPSG:2961, CGVD2013 heights. Downloaded from `DTM_URL` on first run if missing |
+| `NONNA10_4460N06360W.tiff`, `NONNA10_4460N06370W.tiff`, `NONNA10_4470N06370W.tiff` | CHS NONNA-10 bathymetry tiles, WGS 84, chart datum heights. They come from the CHS NONNA download cart |
+| `building_proj.gpkg` | NRCan automatically extracted building footprints with `elevmin` and `heightmax`, in EPSG:2961. Written by `fetch_buildings.py` from the national GeoParquet at `BUILDINGS_URL` |
+| `berth.gpkg` | named berth polygons in EPSG:2961, for the berth occupancy analysis. Drawn for this project, not an official dataset |
 
-Python packages:
+Everything runs on Python 3.14. Install the packages with:
 
-- Services and app: `pip install duckdb websockets`
-- Terrain and building exports: `pip install rasterio quantized-mesh-encoder pydelatin geopandas pyproj mapbox-earcut`
-
-The project was developed with Python 3.14 for the services and Python 3.10 for the exports.
+```bash
+pip install -r requirements.txt
+```
 
 The AIS consumer needs a free API key from [aisstream.io](https://aisstream.io) in the
-`AISSTREAM_API_KEY` environment variable. The CHS and MSC APIs need no key.
+`AISSTREAM_API_KEY` environment variable. Getting the key needs a GitHub login, so you'll need a
+GitHub account. The CHS and MSC APIs need no key.
 
 ## Running it
 
@@ -77,6 +81,7 @@ Run everything from `scripts/`.
 
 ```bash
 python export_terrain.py            # merge DTM + NONNA-10, write the COG and DATA_DIR/terrain/
+python fetch_buildings.py           # write DATA_DIR/building_proj.gpkg
 python extrude_buildings.py         # write DATA_DIR/building_3d.gpkg
 python export_buildings_3dtiles.py  # write DATA_DIR/buildings_3dtiles/
 ```
@@ -105,8 +110,12 @@ python twin_app.py
 ```
 
 `twin_app.py` serves the app over HTTP on port 8000 and runs the three websocket feeds itself,
-on ports 8765 (vessels), 8766 (tide) and 8767 (storm surge). Each feed can also run on its own,
-for example `python tide_live.py`.
+all on port 8765 at `/vessels`, `/tide` and `/storm_surge` (`--port` and `--feed-port` change
+the two ports). Each feed can also run on its own, for example `python tide_live.py`.
+
+Behind HTTPS, the page connects to the feeds with `wss://` on the same host. Put a TLS proxy
+(nginx, Caddy and so on) in front of both ports, 8000 and 8765, and let it pass websocket
+upgrades through on 8765.
 
 **Tests:**
 
@@ -166,14 +175,18 @@ ion token is needed. Open a panel directly with `?tab=live`, `?tab=replay` or `?
 
 ### Terrain and buildings
 
-**[load_rasters.py](scripts/load_rasters.py)** loads the 1 m DTM and the 10 m NONNA-10
-bathymetry. It shifts NONNA-10 from chart datum to CGVD2013 (`CD_TO_CGVD2013 = -1.41` m) and
+**[load_rasters.py](scripts/load_rasters.py)** loads the 1 m DTM (downloading it if needed) and
+mosaics the three NONNA-10 tiles, both clipped to the bounding box of `extent.gpkg`. It shifts NONNA-10 from chart datum to CGVD2013 (`CD_TO_CGVD2013 = -1.41` m) and
 resamples it onto the DTM grid. The merge takes bathymetry wherever NONNA-10 has data and the DTM
 everywhere else. It also defines `DATA_DIR`.
 
 **[export_terrain.py](scripts/export_terrain.py)** writes the merged raster as a Cloud Optimized
 GeoTIFF, plus Cesium quantized-mesh terrain tiles for levels 0–16 with vertex normals. Heights
 are shifted from CGVD2013 to the WGS84 ellipsoid by a constant −20.27 m.
+
+**[fetch_buildings.py](scripts/fetch_buildings.py)** reads the national NRCan building
+GeoParquet over HTTP with DuckDB, keeps the footprints that intersect `extent.gpkg`, and writes
+them to `building_proj.gpkg` in EPSG:2961. `--source PATH` reads a copy downloaded by hand.
 
 **[extrude_buildings.py](scripts/extrude_buildings.py)** extrudes each footprint from its ground
 elevation (`elevmin`) by its height (`heightmax`) into a closed solid in EPSG:2961.
@@ -221,7 +234,8 @@ includes the time of the last poll.
 
 **[twin_app.py](scripts/twin_app.py)** serves the app, `DATA_DIR/terrain/` and
 `DATA_DIR/buildings_3dtiles/` over HTTP, and runs the three feeds. It also has two JSON routes:
-- `/api/config` gives the extent, the datum offsets and the feed ports.
+- `/api/config` gives the extent, the datum offsets, the feed port and paths, and whether the
+  terrain and building tiles exist (`layers`).
 - `/api/replay?days=7` gives berth occupancy per day from the analysis files.
 
 ## Data and vertical datums
