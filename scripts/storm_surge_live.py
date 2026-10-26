@@ -71,21 +71,26 @@ def storm_surge_geojson(con, now, latest_path=LATEST_PATH, snapshots_dir=SNAPSHO
         for *props, geometry in rows]}
 
 
-async def serve_live_storm_surge(host=HOST, port=PORT, latest_path=LATEST_PATH,
-                                 snapshots_dir=SNAPSHOTS_DIR, poll_seconds=POLL_SECONDS):
-    """Serve ws://host:port, pushing the current storm surge risk to every browser."""
+def live_storm_surge(latest_path=LATEST_PATH, snapshots_dir=SNAPSHOTS_DIR,
+                     poll_seconds=POLL_SECONDS):
+    """The storm surge feed as (handler, poll): handler(ws) serves one browser and poll()
+    pushes the current storm surge risk to every connected browser until cancelled."""
     con = duckdb.connect()
     con.execute("INSTALL spatial; LOAD spatial; SET TimeZone = 'UTC'")
     current = {"message": None}
+    clients = set()
 
     async def handler(ws):
         log.info("browser connected from %s", ws.remote_address)
-        if current["message"]:
-            await ws.send(current["message"])
-        await ws.wait_closed()
+        clients.add(ws)
+        try:
+            if current["message"]:
+                await ws.send(current["message"])
+            await ws.wait_closed()
+        finally:
+            clients.discard(ws)
 
-    async with serve(handler, host, port) as server:
-        log.info("serving live storm surge risk on ws://%s:%d", host, port)
+    async def poll():
         while True:
             try:
                 collection = storm_surge_geojson(con, datetime.now(timezone.utc),
@@ -96,11 +101,23 @@ async def serve_live_storm_surge(host=HOST, port=PORT, latest_path=LATEST_PATH,
                 message = collection and json.dumps(collection)
                 if message and message != current["message"]:
                     current["message"] = message
-                    broadcast(server.connections, message)
+                    broadcast(clients, message)
                     log.info("pushed %d storm surge features (fetched %s) to %d browsers",
                              len(collection["features"]), collection["fetched_at"],
-                             len(server.connections))
+                             len(clients))
             await asyncio.sleep(poll_seconds)
+
+    return handler, poll
+
+
+async def serve_live_storm_surge(host=HOST, port=PORT, latest_path=LATEST_PATH,
+                                 snapshots_dir=SNAPSHOTS_DIR, poll_seconds=POLL_SECONDS):
+    """Serve the storm surge feed on ws://host:port on its own (twin_app.py serves it at
+    /storm_surge)."""
+    handler, poll = live_storm_surge(latest_path, snapshots_dir, poll_seconds)
+    async with serve(handler, host, port):
+        log.info("serving live storm surge risk on ws://%s:%d", host, port)
+        await poll()
 
 
 if __name__ == "__main__":

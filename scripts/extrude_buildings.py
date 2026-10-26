@@ -1,8 +1,8 @@
 """
 Extrude the building footprints into closed 3D solids.
 
-  Input    DATA_DIR/building_proj.gpkg  (EPSG:4617 footprints, NRCan automatically
-           extracted buildings)
+  Input    DATA_DIR/building_proj.gpkg  (NRCan automatically extracted building
+           footprints for the extent, from fetch_buildings.py; any CRS)
   Output   DATA_DIR/building_3d.gpkg, layer building_3d
            EPSG:2961, CGVD2013 heights (same as the DTM)
 

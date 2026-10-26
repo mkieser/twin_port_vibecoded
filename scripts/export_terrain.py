@@ -27,9 +27,8 @@ from rasterio.warp import Resampling, reproject, transform_bounds
 from pydelatin import Delatin
 import quantized_mesh_encoder as qme
 
-from load_rasters import (DATA_DIR, DTM_PATH, NONNA_PATH, MERGED_PATH,
-                          adjust_nonna, load_raster, merge_rasters, resample_to,
-                          write_raster)
+from load_rasters import (DATA_DIR, MERGED_PATH, load_inputs, merge_rasters,
+                          resample_to, write_raster)
 
 COG_PATH = DATA_DIR / "dtm_nonna10_merged_cog.tif"
 TERRAIN_DIR = DATA_DIR / "terrain"
@@ -127,8 +126,7 @@ def write_terrain(src_path, out_dir):
 
 
 if __name__ == "__main__":
-    dtm = load_raster(DTM_PATH, "DTM (land elevation)")
-    nonna = adjust_nonna(load_raster(NONNA_PATH, "NONNA-10 (bathymetry)"), dtm.nodata)
+    dtm, nonna = load_inputs()
     write_raster(merge_rasters(dtm, resample_to(nonna, dtm)), MERGED_PATH)
     del dtm, nonna
     print(f"Wrote {MERGED_PATH}")

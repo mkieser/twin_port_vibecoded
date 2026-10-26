@@ -78,9 +78,9 @@ def positions_geojson(con, paths, vessels_path=VESSELS_PATH):
         for *props, lon, lat in rows]}
 
 
-async def serve_live_positions(host=HOST, port=PORT, positions_dir=POSITIONS_DIR,
-                               poll_seconds=POLL_SECONDS, vessels_path=None):
-    """Serve ws://host:port, pushing the recent positions files' vessels to every browser.
+def live_positions(positions_dir=POSITIONS_DIR, poll_seconds=POLL_SECONDS, vessels_path=None):
+    """The vessels feed as (handler, poll): handler(ws) serves one browser and poll() pushes
+    the recent positions files' vessels to every connected browser until cancelled.
 
     vessels_path defaults to vessels.parquet beside positions_dir, as the consumer writes it.
     """
@@ -88,15 +88,19 @@ async def serve_live_positions(host=HOST, port=PORT, positions_dir=POSITIONS_DIR
     con = duckdb.connect()
     con.execute("SET TimeZone = 'UTC'")
     current = {"file": None, "message": None}
+    clients = set()
 
     async def handler(ws):
         log.info("browser connected from %s", ws.remote_address)
-        if current["message"]:
-            await ws.send(current["message"])
-        await ws.wait_closed()
+        clients.add(ws)
+        try:
+            if current["message"]:
+                await ws.send(current["message"])
+            await ws.wait_closed()
+        finally:
+            clients.discard(ws)
 
-    async with serve(handler, host, port) as server:
-        log.info("serving live positions on ws://%s:%d", host, port)
+    async def poll():
         while True:
             paths = recent_files(positions_dir)
             if paths and paths[0] != current["file"]:
@@ -106,10 +110,21 @@ async def serve_live_positions(host=HOST, port=PORT, positions_dir=POSITIONS_DIR
                     log.warning("skipping %s for now: %s", paths[0].name, exc)
                 else:
                     current.update(file=paths[0], message=json.dumps(collection))
-                    broadcast(server.connections, current["message"])
+                    broadcast(clients, current["message"])
                     log.info("pushed %d vessels from %d files to %d browsers",
-                             len(collection["features"]), len(paths), len(server.connections))
+                             len(collection["features"]), len(paths), len(clients))
             await asyncio.sleep(poll_seconds)
+
+    return handler, poll
+
+
+async def serve_live_positions(host=HOST, port=PORT, positions_dir=POSITIONS_DIR,
+                               poll_seconds=POLL_SECONDS, vessels_path=None):
+    """Serve the vessels feed on ws://host:port on its own (twin_app.py serves it at /vessels)."""
+    handler, poll = live_positions(positions_dir, poll_seconds, vessels_path)
+    async with serve(handler, host, port):
+        log.info("serving live positions on ws://%s:%d", host, port)
+        await poll()
 
 
 if __name__ == "__main__":

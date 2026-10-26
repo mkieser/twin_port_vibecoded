@@ -28,7 +28,8 @@
   </section>
   <section class="card">
     <h2>Vessels</h2>
-    <div class="status" id="vessels-status" data-state="connecting">connecting…</div>
+    <div class="status" id="vessels-status" data-state="connecting" role="status">connecting…</div>
+    <div class="hint" id="vessels-hint" hidden></div>
     <div class="muted"><span id="vessel-count">0</span> in the extent · updated <span id="vessels-updated">–</span></div>
     <ul class="legend" id="type-legend"></ul>
     <ul class="legend">
@@ -58,6 +59,7 @@
 </aside>
 
 <aside class="panel" id="panel-flood" role="tabpanel" aria-labelledby="tab-flood" hidden>
+  <section class="card notice" id="layers-notice" role="status" hidden></section>
   <section class="card">
     <h2>Water plane</h2>
     <div class="hero"><span id="water-level">–</span><span class="unit">m CD</span></div>

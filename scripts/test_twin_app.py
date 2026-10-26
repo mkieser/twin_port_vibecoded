@@ -1,3 +1,4 @@
+import asyncio
 import json
 import tempfile
 import unittest
@@ -7,10 +8,12 @@ from datetime import date
 from pathlib import Path
 
 import duckdb
+from websockets.asyncio.client import connect
+from websockets.exceptions import InvalidStatus
 
 from test_ais_live import free_port
 from twin_app import (CHART_DATUM_CGVD2013, app_config, extent_bbox, replay_days,
-                      start_http)
+                      serve_feeds, start_http)
 
 TODAY = date(2026, 10, 23)
 
@@ -71,7 +74,9 @@ class TestConfig(unittest.TestCase):
         west, south, east, north = extent_bbox()
         self.assertTrue(west < -63.57 < east and south < 44.65 < north)
         config = app_config([west, south, east, north])
-        self.assertEqual(config["feeds"], {"vessels": 8765, "tide": 8766, "storm_surge": 8767})
+        self.assertEqual(config["feed_port"], 8765)
+        self.assertEqual(config["feeds"],
+                         {"vessels": "/vessels", "tide": "/tide", "storm_surge": "/storm_surge"})
         self.assertEqual(config["station"], "00490")
 
 
@@ -112,14 +117,61 @@ class TestHttp(unittest.TestCase):
         self.assertEqual(self.get("/terrain/0/0/0.terrain?v=1.0.0")[1],
                          "application/vnd.quantized-mesh")
         self.assertEqual(self.get("/buildings/tileset.json")[0], 200)
-        self.assertEqual(json.loads(self.get("/api/config")[2]), {"extent": [0, 0, 1, 1]})
+        self.assertEqual(json.loads(self.get("/api/config")[2]),
+                         {"extent": [0, 0, 1, 1], "layers": {"terrain": True, "buildings": True}})
         self.assertEqual(len(json.loads(self.get("/api/replay?days=3")[2])["days"]), 3)
+
+    def test_config_reports_missing_layers(self):
+        root = Path(self.tmp.name)
+        (root / "buildings" / "tileset.json").unlink()
+        self.assertEqual(json.loads(self.get("/api/config")[2])["layers"],
+                         {"terrain": True, "buildings": False})
+        (root / "terrain" / "layer.json").unlink()
+        self.assertEqual(json.loads(self.get("/api/config")[2])["layers"],
+                         {"terrain": False, "buildings": False})
 
     def test_not_found(self):
         self.assertEqual(self.get("/missing.js")[0], 404)
         self.assertEqual(self.get("/terrain/")[0], 404)            # no directory listings
         self.assertEqual(self.get("/terrain/%2e%2e/secret.txt")[0], 404)
         self.assertEqual(self.get("/api/replay?days=week")[0], 400)
+
+
+def fake_feed(message):
+    """A (handler, poll) feed that greets each browser with `message` and never polls."""
+    async def handler(ws):
+        await ws.send(message)
+        await ws.wait_closed()
+
+    async def poll():
+        await asyncio.Event().wait()
+
+    return handler, poll
+
+
+class TestFeedRouting(unittest.TestCase):
+    def test_paths_share_one_port(self):
+        port = free_port()
+
+        async def run():
+            server = asyncio.create_task(serve_feeds(
+                "localhost", port, {"/tide": fake_feed("tide"), "/vessels": fake_feed("vessels")}))
+            await asyncio.sleep(0.3)
+            try:
+                got = {}
+                for path in ("/tide", "/vessels", "/vessels?v=2"):
+                    async with connect(f"ws://localhost:{port}{path}") as ws:
+                        got[path] = await asyncio.wait_for(ws.recv(), 2)
+                with self.assertRaises(InvalidStatus) as cm:
+                    async with connect(f"ws://localhost:{port}/nope"):
+                        pass
+                return got, cm.exception.response.status_code
+            finally:
+                server.cancel()
+
+        got, status = asyncio.run(run())
+        self.assertEqual(got, {"/tide": "tide", "/vessels": "vessels", "/vessels?v=2": "vessels"})
+        self.assertEqual(status, 404)
 
 
 if __name__ == "__main__":
