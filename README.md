@@ -58,9 +58,10 @@ inputs it expects are:
 | File | What it is |
 |---|---|
 | `extent.gpkg` | the project extent, a 10 km square polygon in EPSG:2961 |
-| `dtm_1m_utm20_w_4_94.tif` | 1 m lidar DTM (NRCan HRDEM), EPSG:2961, CGVD2013 heights. Downloaded from `DTM_URL` on first run if missing |
+| `dtm_1m_utm20_w_4_94.tif` | 1 m lidar DTM (NRCan HRDEM), EPSG:2961, CGVD2013 heights. Downloaded from `DTM_URL` on first run if missing; if the server refuses, download it in a browser and save it here |
 | `NONNA10_4460N06360W.tiff`, `NONNA10_4460N06370W.tiff`, `NONNA10_4470N06370W.tiff` | CHS NONNA-10 bathymetry tiles, WGS 84, chart datum heights. They come from the CHS NONNA download cart |
-| `building_proj.gpkg` | NRCan automatically extracted building footprints with `elevmin` and `heightmax`, in EPSG:2961. Written by `fetch_buildings.py` from the national GeoParquet at `BUILDINGS_URL` |
+| `auto_building_opti_2.parquet` | NRCan automatically extracted buildings for all of Canada (2.4 GB GeoParquet). Download it from `BUILDINGS_URL` in [scripts/fetch_buildings.py](scripts/fetch_buildings.py) with a browser: the server refuses scripted downloads. Not committed |
+| `building_proj.gpkg` | the extent's building footprints with `elevmin` and `heightmax`, in EPSG:2961. Written by `fetch_buildings.py` from `auto_building_opti_2.parquet` |
 | `berth.gpkg` | named berth polygons in EPSG:2961, for the berth occupancy analysis. Drawn for this project, not an official dataset |
 
 Everything runs on Python 3.14. Install the packages with:
@@ -185,8 +186,11 @@ GeoTIFF, plus Cesium quantized-mesh terrain tiles for levels 0–16 with vertex 
 are shifted from CGVD2013 to the WGS84 ellipsoid by a constant −20.27 m.
 
 **[fetch_buildings.py](scripts/fetch_buildings.py)** reads the national NRCan building
-GeoParquet over HTTP with DuckDB, keeps the footprints that intersect `extent.gpkg`, and writes
-them to `building_proj.gpkg` in EPSG:2961. `--source PATH` reads a copy downloaded by hand.
+GeoParquet with DuckDB, from `data/auto_building_opti_2.parquet` if it is there and otherwise
+over HTTP from `BUILDINGS_URL`. It keeps the footprints that intersect `extent.gpkg` and writes
+them to `building_proj.gpkg` in EPSG:2961. `--source` reads another copy. Three of the
+footprints are about 150 m tall with small footprints at the Fairview Cove container terminal,
+probably cranes that the automatic extraction took for buildings.
 
 **[extrude_buildings.py](scripts/extrude_buildings.py)** extrudes each footprint from its ground
 elevation (`elevmin`) by its height (`heightmax`) into a closed solid in EPSG:2961.

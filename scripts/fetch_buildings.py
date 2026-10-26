@@ -1,9 +1,11 @@
 """
 Cut the project's building footprints out of the national NRCan building layer.
 
-  Source   BUILDINGS_URL, NRCan automatically extracted buildings (auto_building_opti_2),
-           one GeoParquet file for all of Canada (~2.4 GB). It is read in place over
-           HTTP; only the parts DuckDB needs are fetched, nothing is saved.
+  Source   NRCan automatically extracted buildings (auto_building_opti_2), one GeoParquet
+           file for all of Canada (~2.4 GB). Read from DATA_DIR/auto_building_opti_2.parquet
+           if it is there, otherwise in place from BUILDINGS_URL over HTTP (only the parts
+           DuckDB needs are fetched, nothing is saved). The NRCan server can refuse
+           scripted downloads; if so, download it in a browser and save it in DATA_DIR.
   Extent   DATA_DIR/extent.gpkg  (EPSG:2961 polygon, the 10 km data square)
   Output   DATA_DIR/building_proj.gpkg, layer building
            EPSG:2961, every source attribute (extrude_buildings.py needs elevmin and
@@ -13,13 +15,14 @@ The source CRS is taken from the file's GeoParquet metadata (OGC:CRS84 if it nam
 none). When the file has a bbox covering column, rows are filtered on it first so
 DuckDB can skip row groups outside the extent; the exact test is ST_Intersects.
 
-Pass --source PATH to read a copy downloaded by hand instead of BUILDINGS_URL.
+Pass --source PATH_OR_URL to read another copy.
 
 Needs duckdb (pip install duckdb).
 """
 
 import argparse
 import json
+import sys
 
 import duckdb
 
@@ -27,6 +30,7 @@ from load_rasters import DATA_DIR, EXTENT_PATH
 
 BUILDINGS_URL = ("https://download-telecharger.services.geo.ca/pub/nrcan_rncan/extraction/"
                  "auto_building/auto_building_opti_2/auto_building_opti_2.parquet")
+SOURCE_PATH = DATA_DIR / "auto_building_opti_2.parquet"
 BUILDINGS_PATH = DATA_DIR / "building_proj.gpkg"  # extrude_buildings.BUILDINGS_PATH
 CRS = "EPSG:2961"
 REQUIRED = ("elevmin", "heightmax")
@@ -50,7 +54,13 @@ def crs_code(crs):
     return f"{ident['authority']}:{ident['code']}"
 
 
-def fetch_buildings(source=BUILDINGS_URL, extent_path=EXTENT_PATH, dst_path=BUILDINGS_PATH):
+def default_source():
+    """The local copy of the national file if there is one, else its URL."""
+    return SOURCE_PATH if SOURCE_PATH.exists() else BUILDINGS_URL
+
+
+def fetch_buildings(source=None, extent_path=EXTENT_PATH, dst_path=BUILDINGS_PATH):
+    source = source or default_source()
     con = duckdb.connect()
     # x = easting/longitude everywhere, including the GDAL writer (required for SRS in DuckDB 2.0)
     con.execute("INSTALL spatial; LOAD spatial; INSTALL httpfs; LOAD httpfs; "
@@ -102,9 +112,15 @@ def fetch_buildings(source=BUILDINGS_URL, extent_path=EXTENT_PATH, dst_path=BUIL
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
-    parser.add_argument("--source", default=BUILDINGS_URL,
-                        help="GeoParquet path or URL (default: the NRCan file)")
+    parser.add_argument("--source", default=None,
+                        help=f"GeoParquet path or URL (default: {SOURCE_PATH.name} in DATA_DIR "
+                             "if present, else the NRCan URL)")
     args = parser.parse_args()
-    print(f"Reading {args.source}")
-    count, src_crs = fetch_buildings(args.source)
+    source = args.source or default_source()
+    print(f"Reading {source}")
+    try:
+        count, src_crs = fetch_buildings(source)
+    except duckdb.HTTPException as exc:
+        sys.exit(f"{exc}\nDownload {BUILDINGS_URL} in a browser, save it as {SOURCE_PATH} "
+                 "and run this again.")
     print(f"Wrote {count:,} buildings (from {src_crs}) to {BUILDINGS_PATH}")
