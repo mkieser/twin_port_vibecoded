@@ -78,7 +78,11 @@ GitHub account. The CHS and MSC APIs need no key.
 
 Run everything from `scripts/`.
 
-**1. Build the terrain and buildings (once, or when the source data changes):**
+**1. Build the terrain and buildings (optional, once, or when the source data changes).** The
+tiles are too large for the repo, so a public copy is on S3
+([terrain](https://kieser-public.s3.us-east-1.amazonaws.com/terrain/layer.json),
+[buildings](https://kieser-public.s3.us-east-1.amazonaws.com/buildings_3dtiles/tileset.json)),
+and the app loads it for whichever folder hasn't been built locally:
 
 ```bash
 python export_terrain.py            # merge DTM + NONNA-10, write the COG and DATA_DIR/terrain/
@@ -113,6 +117,7 @@ python twin_app.py
 `twin_app.py` serves the app over HTTP on port 8000 and runs the three websocket feeds itself,
 all on port 8765 at `/vessels`, `/tide` and `/storm_surge` (`--port` and `--feed-port` change
 the two ports). Each feed can also run on its own, for example `python tide_live.py`.
+`--no-s3` loads terrain and buildings only from `DATA_DIR`.
 
 Behind HTTPS, the page connects to the feeds with `wss://` on the same host. Put a TLS proxy
 (nginx, Caddy and so on) in front of both ports, 8000 and 8765, and let it pass websocket
@@ -238,8 +243,9 @@ includes the time of the last poll.
 
 **[twin_app.py](scripts/twin_app.py)** serves the app, `DATA_DIR/terrain/` and
 `DATA_DIR/buildings_3dtiles/` over HTTP, and runs the three feeds. It also has two JSON routes:
-- `/api/config` gives the extent, the datum offsets, the feed port and paths, and whether the
-  terrain and building tiles exist (`layers`).
+- `/api/config` gives the extent, the datum offsets, the feed port and paths, and where the page
+  loads terrain and buildings (`layers`): the local folder if built, else the S3 copy (the
+  bucket allows cross-origin GETs), else `null`.
 - `/api/replay?days=7` gives berth occupancy per day from the analysis files.
 
 ## Data and vertical datums

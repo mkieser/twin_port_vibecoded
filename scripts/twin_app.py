@@ -3,11 +3,13 @@ Serve the Port and Coastal Operations Twin: a CesiumJS app with Live, Replay
 and Flood panels, plus the three live websocket feeds it reads.
 
   App      http://HOST:HTTP_PORT/                twin_app/ (index.html, app.js, style.css)
-  Terrain  http://HOST:HTTP_PORT/terrain/...     DATA_DIR/terrain (from export_terrain.py)
+  Terrain  http://HOST:HTTP_PORT/terrain/...     DATA_DIR/terrain (from export_terrain.py),
+                                                  else TERRAIN_URL
   Tiles    http://HOST:HTTP_PORT/buildings/...   DATA_DIR/buildings_3dtiles
-                                                  (from export_buildings_3dtiles.py)
+                                                  (from export_buildings_3dtiles.py),
+                                                  else TILESET_URL
   Config   http://HOST:HTTP_PORT/api/config      extent, datums, feed port and paths, and
-                                                  which of terrain and buildings exist, as JSON
+                                                  where to load terrain and buildings, as JSON
   Replay   http://HOST:HTTP_PORT/api/replay?days=7   berth occupancy per day, as JSON
   Feeds    ws://HOST:FEED_PORT/vessels      vessels            ais_live.py, reading DATA_DIR/ais
            ws://HOST:FEED_PORT/tide         tide level         tide_live.py, reading DATA_DIR/tide
@@ -17,6 +19,11 @@ and Flood panels, plus the three live websocket feeds it reads.
 All three feeds share one websocket port and are told apart by path, so a TLS proxy in
 front of the app (for https:// and wss://) needs just the HTTP port and FEED_PORT. Any
 other path is refused with 404 during the handshake.
+
+The terrain and building tiles are too large for the repo, so a public copy is on S3
+(with a CORS rule allowing GET from any origin). When a folder hasn't been built
+locally, /api/config points the page at the S3 copy and the browser loads it from
+there. --no-s3 uses only the local folders.
 
 The consumers (ais_consumer.py, tide_consumer.py, storm_surge_consumer.py) run
 separately and write the files the feeds read. /api/replay reads the
@@ -69,6 +76,11 @@ REPLAY_DAYS = 7
 APP_DIR = Path(__file__).with_name("twin_app")
 TERRAIN_DIR = DATA_DIR / "terrain"              # export_terrain.TERRAIN_DIR
 TILESET_DIR = DATA_DIR / "buildings_3dtiles"    # export_buildings_3dtiles.TILESET_DIR
+S3_URL = "https://kieser-public.s3.us-east-1.amazonaws.com"
+TERRAIN_URL = f"{S3_URL}/terrain/"
+TILESET_URL = f"{S3_URL}/buildings_3dtiles/"
+REMOTE = {"/terrain/": TERRAIN_URL, "/buildings/": TILESET_URL}
+LAYER_FILES = {"/terrain/": "layer.json", "/buildings/": "tileset.json"}
 
 # Same constant as export_terrain.py, which needs rasterio to import
 CGVD2013_TO_WGS84 = -20.270
@@ -135,8 +147,8 @@ class TwinHandler(SimpleHTTPRequestHandler):
                       ".glb": "model/gltf-binary", ".json": "application/json",
                       ".js": "text/javascript"}
 
-    def __init__(self, *args, config, routes, analysis_dir, vessels_path, **kwargs):
-        self.config, self.routes = config, routes
+    def __init__(self, *args, config, routes, remote, analysis_dir, vessels_path, **kwargs):
+        self.config, self.routes, self.remote = config, routes, remote
         self.analysis_dir, self.vessels_path = analysis_dir, vessels_path
         super().__init__(*args, **kwargs)
 
@@ -153,10 +165,15 @@ class TwinHandler(SimpleHTTPRequestHandler):
             return self.send_json(replay_days(today, days, self.analysis_dir, self.vessels_path))
         return super().do_GET()
 
+    def built(self, prefix):
+        """Whether the folder at `prefix` has been built locally, checked on every request."""
+        return (self.routes[prefix] / LAYER_FILES[prefix]).is_file()
+
     def layers(self):
-        """Whether the terrain and building tiles have been built, checked on every request."""
-        return {"terrain": (self.routes["/terrain/"] / "layer.json").is_file(),
-                "buildings": (self.routes["/buildings/"] / "tileset.json").is_file()}
+        """Where the page loads terrain and buildings: the local folder if built, else S3, else
+        null."""
+        return {name: prefix if self.built(prefix) else self.remote.get(prefix)
+                for name, prefix in [("terrain", "/terrain/"), ("buildings", "/buildings/")]}
 
     def send_json(self, data):
         body = json.dumps(data).encode()
@@ -185,11 +202,14 @@ class TwinHandler(SimpleHTTPRequestHandler):
 
 
 def start_http(host=HOST, port=HTTP_PORT, config=None, app_dir=APP_DIR, terrain_dir=TERRAIN_DIR,
-               tileset_dir=TILESET_DIR, analysis_dir=ANALYSIS_DIR, vessels_path=VESSELS_PATH):
-    """Start the HTTP server in a background thread and return it (call .shutdown() to stop)."""
+               tileset_dir=TILESET_DIR, remote=REMOTE, analysis_dir=ANALYSIS_DIR,
+               vessels_path=VESSELS_PATH):
+    """Start the HTTP server in a background thread and return it (call .shutdown() to stop).
+
+    `remote` maps /terrain/ and /buildings/ to the URLs the page loads when not built locally."""
     routes = {"/terrain/": terrain_dir, "/buildings/": tileset_dir, "/": app_dir}
     handler = partial(TwinHandler, config=config or app_config(extent_bbox()), routes=routes,
-                      analysis_dir=analysis_dir, vessels_path=vessels_path)
+                      remote=remote, analysis_dir=analysis_dir, vessels_path=vessels_path)
     server = ThreadingHTTPServer((host, port), handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
@@ -210,9 +230,10 @@ async def serve_feeds(host, port, feeds):
         await asyncio.gather(*(poll() for _, poll in feeds.values()))
 
 
-async def serve_twin(host=HOST, http_port=HTTP_PORT, feed_port=FEED_PORT):
+async def serve_twin(host=HOST, http_port=HTTP_PORT, feed_port=FEED_PORT, remote=REMOTE):
     """Serve the app over HTTP and the three feeds over one websocket port until cancelled."""
-    server = start_http(host, http_port, config=app_config(extent_bbox(), feed_port))
+    server = start_http(host, http_port, config=app_config(extent_bbox(), feed_port),
+                        remote=remote)
     log.info("twin app on http://%s:%d", host, http_port)
     feeds = {FEED_PATHS["vessels"]: live_positions(),
              FEED_PATHS["tide"]: live_tide(),
@@ -229,9 +250,12 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=HTTP_PORT, help="HTTP port for the app")
     parser.add_argument("--feed-port", type=int, default=FEED_PORT,
                         help="websocket port for the three feeds")
+    parser.add_argument("--no-s3", action="store_true",
+                        help="load terrain and buildings only from DATA_DIR, never from S3")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
-        asyncio.run(serve_twin(args.host, args.port, args.feed_port))
+        asyncio.run(serve_twin(args.host, args.port, args.feed_port,
+                               remote={} if args.no_s3 else REMOTE))
     except KeyboardInterrupt:
         pass

@@ -405,7 +405,7 @@ async function loadFloodLayers() {
     problems.push(LAYER_HELP.terrain);
   } else {
     try {
-      viewer.terrainProvider = await Cesium.CesiumTerrainProvider.fromUrl("/terrain/",
+      viewer.terrainProvider = await Cesium.CesiumTerrainProvider.fromUrl(config.layers.terrain,
         { requestVertexNormals: true });
     } catch (e) {
       problems.push(`<b>Terrain could not be loaded:</b> ${escapeHtml(e.message ?? e)}`);
@@ -426,7 +426,7 @@ async function loadFloodLayers() {
 }
 
 async function loadBuildings() {
-  tileset = await Cesium.Cesium3DTileset.fromUrl("/buildings/tileset.json");
+  tileset = await Cesium.Cesium3DTileset.fromUrl(`${config.layers.buildings}tileset.json`);
   tileset.outlineColor = Cesium.Color.fromCssColorString("#898781");
   tileset.show = currentTab === "flood";
   tileset.tileLoad.addEventListener((tile) => {

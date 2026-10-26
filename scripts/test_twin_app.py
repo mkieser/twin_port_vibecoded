@@ -12,7 +12,7 @@ from websockets.asyncio.client import connect
 from websockets.exceptions import InvalidStatus
 
 from test_ais_live import free_port
-from twin_app import (CHART_DATUM_CGVD2013, app_config, extent_bbox, replay_days,
+from twin_app import (CHART_DATUM_CGVD2013, REMOTE, app_config, extent_bbox, replay_days,
                       serve_feeds, start_http)
 
 TODAY = date(2026, 10, 23)
@@ -94,7 +94,7 @@ class TestHttp(unittest.TestCase):
         self.port = free_port()
         self.server = start_http(
             "localhost", self.port, config={"extent": [0, 0, 1, 1]}, app_dir=root / "app",
-            terrain_dir=root / "terrain", tileset_dir=root / "buildings",
+            terrain_dir=root / "terrain", tileset_dir=root / "buildings", remote={},
             analysis_dir=root / "analysis_daily", vessels_path=root / "vessels.parquet")
 
     def tearDown(self):
@@ -118,17 +118,34 @@ class TestHttp(unittest.TestCase):
                          "application/vnd.quantized-mesh")
         self.assertEqual(self.get("/buildings/tileset.json")[0], 200)
         self.assertEqual(json.loads(self.get("/api/config")[2]),
-                         {"extent": [0, 0, 1, 1], "layers": {"terrain": True, "buildings": True}})
+                         {"extent": [0, 0, 1, 1],
+                          "layers": {"terrain": "/terrain/", "buildings": "/buildings/"}})
         self.assertEqual(len(json.loads(self.get("/api/replay?days=3")[2])["days"]), 3)
 
     def test_config_reports_missing_layers(self):
         root = Path(self.tmp.name)
         (root / "buildings" / "tileset.json").unlink()
         self.assertEqual(json.loads(self.get("/api/config")[2])["layers"],
-                         {"terrain": True, "buildings": False})
+                         {"terrain": "/terrain/", "buildings": None})
         (root / "terrain" / "layer.json").unlink()
         self.assertEqual(json.loads(self.get("/api/config")[2])["layers"],
-                         {"terrain": False, "buildings": False})
+                         {"terrain": None, "buildings": None})
+
+    def test_config_points_at_s3_when_not_built(self):
+        root = Path(self.tmp.name)
+        (root / "buildings" / "tileset.json").unlink()
+        port = free_port()
+        server = start_http("localhost", port, config={}, app_dir=root / "app",
+                            terrain_dir=root / "terrain", tileset_dir=root / "buildings",
+                            analysis_dir=root / "analysis_daily",
+                            vessels_path=root / "vessels.parquet")
+        try:
+            with urllib.request.urlopen(f"http://localhost:{port}/api/config", timeout=2) as r:
+                self.assertEqual(json.load(r)["layers"],
+                                 {"terrain": "/terrain/", "buildings": REMOTE["/buildings/"]})
+        finally:
+            server.shutdown()
+            server.server_close()
 
     def test_not_found(self):
         self.assertEqual(self.get("/missing.js")[0], 404)
