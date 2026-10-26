@@ -7,5 +7,6 @@ data/*.tif
 data/*.part
 data/terrain/
 data/buildings_3dtiles/
+data/coastal_flooding/
 data/building_proj.gpkg
 data/building_3d.gpkg
