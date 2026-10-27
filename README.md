@@ -145,7 +145,7 @@ AWS_PROFILE=personal AIS_DIR=s3://kieser-public/ais TIDE_DIR=s3://kieser-public/
 | `tide_consumer.poll_handler` | Lambda, every 5 minutes | `tide/` |
 | `storm_surge_consumer.poll_handler` | Lambda, every 30 minutes | `coastal_flooding/` |
 | `twin_app.py` (API and feeds) | EC2 `t3.small` behind CloudFront | reads all three |
-| The page (`twin_app/`) | Vercel, https://twinportvibecoded-twinapp.vercel.app/ | none |
+| The page (`twin_app/`) | Vercel, https://twin-port-app.vercel.app/ | none |
 
 All of them run the same image. The AIS consumer isn't on Lambda because the aisstream.io
 websocket stays open indefinitely and Lambda stops after 15 minutes. The tide and storm surge
