@@ -1,8 +1,8 @@
 """
 Push the current storm surge flooding risk to browsers over a websocket.
 
-  Input    DATA_DIR/coastal_flooding/latest.json and the snapshot it names
-           (from storm_surge_consumer.py)
+  Input    FLOODING_DIR/latest.json and the snapshot it names (from
+           storm_surge_consumer.py), a local folder or S3 (see storage.py)
   Output   ws://HOST:PORT, one GeoJSON FeatureCollection per change
 
 latest.json is polled every POLL_SECONDS. The current snapshot's features where
@@ -22,7 +22,7 @@ In the browser, e.g. with Cesium:
     await surge.load(JSON.parse(e.data));   // surge: a Cesium.GeoJsonDataSource
   };
 
-Needs duckdb and websockets (pip install duckdb websockets).
+Needs duckdb and websockets (pip install duckdb websockets, and boto3 for S3).
 """
 
 import asyncio
@@ -33,6 +33,7 @@ from datetime import datetime, timezone
 import duckdb
 from websockets.asyncio.server import broadcast, serve
 
+import storage
 from storm_surge_consumer import LATEST_PATH, SNAPSHOTS_DIR, read_latest
 
 HOST = "localhost"
@@ -63,8 +64,8 @@ def storm_surge_geojson(con, now, latest_path=LATEST_PATH, snapshots_dir=SNAPSHO
         return None
     rows = []
     if latest["snapshot"]:
-        rows = con.execute(STORM_SURGE, {"path": str(snapshots_dir / latest["snapshot"]),
-                                         "now": now}).fetchall()
+        path = storage.join(snapshots_dir, latest["snapshot"])
+        rows = con.execute(STORM_SURGE, {"path": str(path), "now": now}).fetchall()
     return {"type": "FeatureCollection", "fetched_at": latest["fetched_at"], "features": [
         {"type": "Feature", "geometry": json.loads(geometry),
          "properties": dict(zip(PROPERTIES, props))}
@@ -75,8 +76,7 @@ def live_storm_surge(latest_path=LATEST_PATH, snapshots_dir=SNAPSHOTS_DIR,
                      poll_seconds=POLL_SECONDS):
     """The storm surge feed as (handler, poll): handler(ws) serves one browser and poll()
     pushes the current storm surge risk to every connected browser until cancelled."""
-    con = duckdb.connect()
-    con.execute("INSTALL spatial; LOAD spatial; SET TimeZone = 'UTC'")
+    con = storage.connect(snapshots_dir)
     current = {"message": None}
     clients = set()
 

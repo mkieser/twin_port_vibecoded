@@ -1,0 +1,556 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  3d_port live data on AWS, all writing to or reading from S3: ais_consumer.py on
+  ECS Fargate (one task, always on) streaming aisstream.io positions, its
+  compact_handler on Lambda once a day, tide_consumer.py and storm_surge_consumer.py
+  as scheduled Lambda polls, and twin_app.py (the API and websocket feeds for the
+  page on Vercel) on EC2 behind CloudFront. Deployed by deploy/deploy.sh, which
+  builds and pushes ImageUri first.
+
+Parameters:
+  ImageUri:
+    Type: String
+    Description: The deploy/Dockerfile image in ECR, tagged
+  Bucket:
+    Type: String
+    Default: kieser-public
+  AisPrefix:
+    Type: String
+    Default: ais
+    Description: AIS_DIR is s3://Bucket/AisPrefix
+  TidePrefix:
+    Type: String
+    Default: tide
+    Description: TIDE_DIR is s3://Bucket/TidePrefix
+  FloodingPrefix:
+    Type: String
+    Default: coastal_flooding
+    Description: FLOODING_DIR is s3://Bucket/FloodingPrefix
+  ApiKeySecretArn:
+    Type: String
+    Description: >-
+      ARN of the Secrets Manager secret holding the aisstream.io API key as plain
+      text (ECS takes a bare name for an SSM parameter instead)
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Public subnets; the tasks get public IPs to reach aisstream.io and S3
+  CompactSchedule:
+    Type: String
+    Default: cron(30 0 * * ? *)
+    Description: When to compact yesterday (UTC)
+  CloudFrontPrefixListId:
+    Type: String
+    Description: The com.amazonaws.global.cloudfront.origin-facing managed prefix list
+  TwinInstanceType:
+    Type: String
+    Default: t3.small
+  TwinAmi:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Conditions:
+  IsUsEast1: !Equals [!Ref AWS::Region, us-east-1]
+
+Resources:
+  # S3 access shared by the consumer task and the compaction function
+  AisDataPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: [s3:GetObject, s3:PutObject]
+            Resource: !Sub arn:${AWS::Partition}:s3:::${Bucket}/${AisPrefix}/*
+          - Effect: Allow
+            Action: s3:ListBucket   # also covers HeadBucket, used to find the bucket's region
+            Resource: !Sub arn:${AWS::Partition}:s3:::${Bucket}
+
+  TideDataPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: [s3:GetObject, s3:PutObject]
+            Resource: !Sub arn:${AWS::Partition}:s3:::${Bucket}/${TidePrefix}/*
+          - Effect: Allow
+            Action: s3:ListBucket
+            Resource: !Sub arn:${AWS::Partition}:s3:::${Bucket}
+
+  FloodingDataPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: [s3:GetObject, s3:PutObject]
+            Resource: !Sub arn:${AWS::Partition}:s3:::${Bucket}/${FloodingPrefix}/*
+          - Effect: Allow
+            Action: s3:ListBucket
+            Resource: !Sub arn:${AWS::Partition}:s3:::${Bucket}
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /3d-port/ais
+      RetentionInDays: 30
+
+  TideLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /3d-port/tide
+      RetentionInDays: 30
+
+  FloodingLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /3d-port/storm-surge
+      RetentionInDays: 30
+
+  # --- Consumer: ECS Fargate ---
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: 3d-port
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: read-api-key
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref ApiKeySecretArn
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns: [!Ref AisDataPolicy]
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: 3d-port-ais-consumer
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "256"
+      Memory: "1024"
+      RuntimePlatform: {CpuArchitecture: X86_64, OperatingSystemFamily: LINUX}
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: ais-consumer
+          Image: !Ref ImageUri
+          EntryPoint: [python3, ais_consumer.py]
+          Essential: true
+          StopTimeout: 30   # SIGTERM flushes the buffer before exit
+          Environment:
+            - {Name: AIS_DIR, Value: !Sub "s3://${Bucket}/${AisPrefix}"}
+            - {Name: PYTHONUNBUFFERED, Value: "1"}
+          Secrets:
+            - {Name: AISSTREAM_API_KEY, ValueFrom: !Ref ApiKeySecretArn}
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: consumer
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: AIS consumer, outbound only
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - {IpProtocol: "-1", CidrIp: 0.0.0.0/0}
+
+  Service:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: ais-consumer
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: 1
+      # Never two consumers at once (they would both rewrite vessels.parquet):
+      # a deploy stops the old task before starting the new one
+      DeploymentConfiguration:
+        MaximumPercent: 100
+        MinimumHealthyPercent: 0
+        DeploymentCircuitBreaker: {Enable: true, Rollback: true}
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref SubnetIds
+          SecurityGroups: [!Ref SecurityGroup]
+
+  # --- Daily compaction: Lambda ---
+
+  CompactRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref AisDataPolicy
+
+  CompactFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: 3d-port-ais-compact
+      PackageType: Image
+      Code: {ImageUri: !Ref ImageUri}
+      ImageConfig: {Command: [ais_consumer.compact_handler]}
+      Architectures: [x86_64]
+      MemorySize: 2048
+      Timeout: 900
+      Role: !GetAtt CompactRole.Arn
+      Environment:
+        Variables:
+          AIS_DIR: !Sub "s3://${Bucket}/${AisPrefix}"
+      LoggingConfig: {LogGroup: !Ref LogGroup}
+
+  CompactRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Compact and analyze yesterday's AIS positions
+      ScheduleExpression: !Ref CompactSchedule
+      Targets:
+        - {Id: compact, Arn: !GetAtt CompactFunction.Arn}
+
+  CompactPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CompactFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CompactRule.Arn
+
+  # --- Tide and storm surge consumers: scheduled Lambda polls ---
+
+  PollRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref TideDataPolicy
+        - !Ref FloodingDataPolicy
+
+  TideFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: 3d-port-tide-poll
+      PackageType: Image
+      Code: {ImageUri: !Ref ImageUri}
+      ImageConfig: {Command: [tide_consumer.poll_handler]}
+      Architectures: [x86_64]
+      MemorySize: 512
+      Timeout: 120
+      Role: !GetAtt PollRole.Arn
+      Environment:
+        Variables:
+          TIDE_DIR: !Sub "s3://${Bucket}/${TidePrefix}"
+      LoggingConfig: {LogGroup: !Ref TideLogGroup}
+
+  StormSurgeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: 3d-port-storm-surge-poll
+      PackageType: Image
+      Code: {ImageUri: !Ref ImageUri}
+      ImageConfig: {Command: [storm_surge_consumer.poll_handler]}
+      Architectures: [x86_64]
+      MemorySize: 1024
+      Timeout: 300
+      Role: !GetAtt PollRole.Arn
+      Environment:
+        Variables:
+          FLOODING_DIR: !Sub "s3://${Bucket}/${FloodingPrefix}"
+      LoggingConfig: {LogGroup: !Ref FloodingLogGroup}
+
+  # A failed poll isn't retried: the next scheduled one comes soon enough, and a
+  # retry could overlap it (both would rewrite the same file)
+  TideInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref TideFunction
+      Qualifier: $LATEST
+      MaximumRetryAttempts: 0
+
+  StormSurgeInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref StormSurgeFunction
+      Qualifier: $LATEST
+      MaximumRetryAttempts: 0
+
+  TideRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Store the latest Halifax tide level (tide_consumer.POLL_SECONDS)
+      ScheduleExpression: rate(5 minutes)
+      Targets:
+        - {Id: tide, Arn: !GetAtt TideFunction.Arn}
+
+  StormSurgeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Store the coastal flooding risk index (storm_surge_consumer.POLL_SECONDS)
+      ScheduleExpression: rate(30 minutes)
+      Targets:
+        - {Id: storm-surge, Arn: !GetAtt StormSurgeFunction.Arn}
+
+  TidePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref TideFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt TideRule.Arn
+
+  StormSurgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref StormSurgeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt StormSurgeRule.Arn
+
+  # --- The twin app: twin_app.py on EC2, behind CloudFront ---
+  # The page itself is on Vercel, which forwards /api/* to CloudFront; the browser
+  # opens the feeds on CloudFront directly (Vercel can't forward websockets).
+  # CloudFront gives https:// and wss:// without a domain of our own, and reaches the
+  # instance by its Elastic IP's public DNS name, so the address never changes.
+
+  TwinLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /3d-port/twin
+      RetentionInDays: 30
+
+  # The image to run, read by the instance each time the service starts; deploy.sh
+  # restarts it after changing this
+  TwinImageParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /3d-port/twin-image
+      Type: String
+      Value: !Ref ImageUri
+
+  TwinRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore   # Session Manager, send-command
+      Policies:
+        - PolicyName: twin-app
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::${Bucket}/${AisPrefix}/*
+                  - !Sub arn:${AWS::Partition}:s3:::${Bucket}/${TidePrefix}/*
+                  - !Sub arn:${AWS::Partition}:s3:::${Bucket}/${FloodingPrefix}/*
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub arn:${AWS::Partition}:s3:::${Bucket}
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TwinImageParameter}
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt TwinLogGroup.Arn
+
+  TwinInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref TwinRole]
+
+  # Only CloudFront reaches the app (8000) and the feeds (8001). One rule: the
+  # prefix list counts as about 55 rules against the group's limit of 60.
+  TwinSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: twin_app.py, reached only through CloudFront
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 8000, ToPort: 8001, SourcePrefixListId: !Ref CloudFrontPrefixListId}
+      SecurityGroupEgress:
+        - {IpProtocol: "-1", CidrIp: 0.0.0.0/0}
+
+  # A new Amazon Linux AMI replaces the instance on the next deploy, which is how it
+  # gets OS updates; the Elastic IP moves to the new one
+  TwinInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref TwinAmi
+      InstanceType: !Ref TwinInstanceType
+      SubnetId: !Select [0, !Ref SubnetIds]
+      SecurityGroupIds: [!Ref TwinSecurityGroup]
+      IamInstanceProfile: !Ref TwinInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs: {VolumeSize: 16, VolumeType: gp3, Encrypted: true}
+      Tags: [{Key: Name, Value: 3d-port-twin}]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          dnf install -y docker
+          systemctl enable --now docker
+
+          cat > /etc/twin.env <<EOF
+          AIS_DIR=s3://${Bucket}/${AisPrefix}
+          TIDE_DIR=s3://${Bucket}/${TidePrefix}
+          FLOODING_DIR=s3://${Bucket}/${FloodingPrefix}
+          FEED_URL=wss://${TwinDistribution.DomainName}
+          AWS_REGION=${AWS::Region}
+          PYTHONUNBUFFERED=1
+          EOF
+
+          # Pull the image named in the parameter and run it in the foreground
+          cat > /usr/local/bin/twin-start <<'EOF'
+          #!/bin/bash
+          set -euo pipefail
+          export AWS_REGION=${AWS::Region}
+          image=$(aws ssm get-parameter --name ${TwinImageParameter} --query Parameter.Value --output text)
+          aws ecr get-login-password | docker login --username AWS --password-stdin "${!image%%/*}"
+          docker pull "$image"
+          docker rm -f twin 2>/dev/null || true
+          docker image prune -af
+          exec docker run --name twin --network host --env-file /etc/twin.env \
+            --log-driver awslogs --log-opt awslogs-group=${TwinLogGroup} \
+            --log-opt awslogs-region=${AWS::Region} --log-opt awslogs-stream=twin-app \
+            --entrypoint python3 "$image" twin_app.py --host 0.0.0.0 --port 8000 --feed-port 8001
+          EOF
+          chmod +x /usr/local/bin/twin-start
+
+          cat > /etc/systemd/system/twin.service <<'EOF'
+          [Unit]
+          Description=twin_app.py
+          After=docker.service network-online.target
+          Requires=docker.service
+          Wants=network-online.target
+
+          [Service]
+          ExecStart=/usr/local/bin/twin-start
+          ExecStop=/usr/bin/docker stop twin
+          Restart=always
+          RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          systemctl daemon-reload
+          systemctl enable --now twin
+
+  TwinIp:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags: [{Key: Name, Value: 3d-port-twin}]
+
+  TwinIpAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt TwinIp.AllocationId
+      InstanceId: !Ref TwinInstance
+
+  TwinDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: 3d-port twin_app.py
+        PriceClass: PriceClass_100
+        HttpVersion: http2
+        # The Elastic IP's public DNS name, e.g. ec2-3-80-12-34.compute-1.amazonaws.com:
+        # the app on 8000, the feeds on 8001
+        Origins:
+          - Id: app
+            DomainName: !Join ["", [ec2-, !Join ["-", !Split [".", !Ref TwinIp]], !If [IsUsEast1, .compute-1.amazonaws.com, !Sub ".${AWS::Region}.compute.amazonaws.com"]]]
+            CustomOriginConfig: {HTTPPort: 8000, OriginProtocolPolicy: http-only}
+          - Id: feeds
+            DomainName: !Join ["", [ec2-, !Join ["-", !Split [".", !Ref TwinIp]], !If [IsUsEast1, .compute-1.amazonaws.com, !Sub ".${AWS::Region}.compute.amazonaws.com"]]]
+            CustomOriginConfig: {HTTPPort: 8001, OriginProtocolPolicy: http-only}
+        DefaultCacheBehavior:
+          TargetOriginId: app
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad          # CachingDisabled
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac  # AllViewerExceptHostHeader
+        # twin_app.FEED_PATHS; the websocket headers pass with all the others
+        CacheBehaviors:
+          - PathPattern: /vessels
+            TargetOriginId: feeds
+            ViewerProtocolPolicy: redirect-to-https
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          - PathPattern: /tide
+            TargetOriginId: feeds
+            ViewerProtocolPolicy: redirect-to-https
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          - PathPattern: /storm_surge
+            TargetOriginId: feeds
+            ViewerProtocolPolicy: redirect-to-https
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+
+Outputs:
+  AisDir:
+    Value: !Sub "s3://${Bucket}/${AisPrefix}"
+  LogGroup:
+    Value: !Ref LogGroup
+  CompactFunction:
+    Value: !Ref CompactFunction
+  TideDir:
+    Value: !Sub "s3://${Bucket}/${TidePrefix}"
+  FloodingDir:
+    Value: !Sub "s3://${Bucket}/${FloodingPrefix}"
+  TwinUrl:
+    Value: !Sub "https://${TwinDistribution.DomainName}"
+  TwinInstance:
+    Value: !Ref TwinInstance

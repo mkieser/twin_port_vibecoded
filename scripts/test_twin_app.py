@@ -75,6 +75,9 @@ class TestConfig(unittest.TestCase):
         self.assertTrue(west < -63.57 < east and south < 44.65 < north)
         config = app_config([west, south, east, north])
         self.assertEqual(config["feed_port"], 8765)
+        self.assertIsNone(config["feed_url"])
+        self.assertEqual(app_config([], feed_url="wss://example.cloudfront.net")["feed_url"],
+                         "wss://example.cloudfront.net")
         self.assertEqual(config["feeds"],
                          {"vessels": "/vessels", "tide": "/tide", "storm_surge": "/storm_surge"})
         self.assertEqual(config["station"], "00490")

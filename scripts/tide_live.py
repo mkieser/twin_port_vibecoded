@@ -1,7 +1,8 @@
 """
 Push the most recent tide level to browsers over a websocket.
 
-  Input    the newest file in DATA_DIR/tide/levels (from tide_consumer.py)
+  Input    the newest file in TIDE_DIR/levels (from tide_consumer.py), a local
+           folder or S3 (see storage.py)
   Output   ws://HOST:PORT, one JSON message per new reading
 
 The levels folder is polled every POLL_SECONDS. When the newest reading's ts
@@ -24,9 +25,13 @@ In the browser:
     label.textContent = `${tide.tide_level.toFixed(2)} m at ${new Date(tide.ts).toLocaleTimeString()}`;
   };
 
-Needs duckdb and websockets (pip install duckdb websockets).
+Run on its own, it listens on localhost; --host 0.0.0.0 serves other machines too
+(deploy/ runs it that way on ECS Fargate).
+
+Needs duckdb and websockets (pip install duckdb websockets, and boto3 for S3).
 """
 
+import argparse
 import asyncio
 import json
 import logging
@@ -35,6 +40,7 @@ from datetime import datetime, timedelta
 import duckdb
 from websockets.asyncio.server import broadcast, serve
 
+import storage
 from tide_consumer import LEVELS_DIR, STATION_CODE
 
 HOST = "localhost"
@@ -69,7 +75,8 @@ def trend(latest, previous):
 
 def latest_tide(con, levels_dir=LEVELS_DIR, station=STATION_CODE):
     """The newest stored reading with its trend as a dict, or None if nothing is stored yet."""
-    files = sorted(levels_dir.glob("levels_*.parquet"))[-2:]  # names sort by date
+    files = sorted((f for _, f in storage.list_files(levels_dir, ".parquet")
+                    if storage.basename(f).startswith("levels_")), key=str)[-2:]  # by date
     if not files:
         return None
     # The previous reading can be in yesterday's file, just after midnight UTC
@@ -86,8 +93,7 @@ def latest_tide(con, levels_dir=LEVELS_DIR, station=STATION_CODE):
 def live_tide(levels_dir=LEVELS_DIR, poll_seconds=POLL_SECONDS):
     """The tide feed as (handler, poll): handler(ws) serves one browser and poll() pushes
     each new tide reading to every connected browser until cancelled."""
-    con = duckdb.connect()
-    con.execute("SET TimeZone = 'UTC'")
+    con = storage.connect(levels_dir, spatial=False)
     current = {"ts": None, "message": None}
     clients = set()
 
@@ -128,8 +134,12 @@ async def serve_live_tide(host=HOST, port=PORT, levels_dir=LEVELS_DIR,
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--host", default=HOST, help="interface to listen on")
+    parser.add_argument("--port", type=int, default=PORT)
+    args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
-        asyncio.run(serve_live_tide())
+        asyncio.run(serve_live_tide(args.host, args.port))
     except KeyboardInterrupt:
         pass

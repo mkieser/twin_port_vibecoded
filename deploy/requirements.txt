@@ -1,0 +1,5 @@
+# What the scripts need in the deploy image (load_rasters imports numpy)
+duckdb==1.5.6
+websockets>=17.3
+numpy>=2.5.4
+boto3

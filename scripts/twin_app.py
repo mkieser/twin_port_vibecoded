@@ -11,14 +11,16 @@ and Flood panels, plus the three live websocket feeds it reads.
   Config   http://HOST:HTTP_PORT/api/config      extent, datums, feed port and paths, and
                                                   where to load terrain and buildings, as JSON
   Replay   http://HOST:HTTP_PORT/api/replay?days=7   berth occupancy per day, as JSON
-  Feeds    ws://HOST:FEED_PORT/vessels      vessels            ais_live.py, reading DATA_DIR/ais
-           ws://HOST:FEED_PORT/tide         tide level         tide_live.py, reading DATA_DIR/tide
+  Feeds    ws://HOST:FEED_PORT/vessels      vessels            ais_live.py, reading AIS_DIR
+           ws://HOST:FEED_PORT/tide         tide level         tide_live.py, reading TIDE_DIR
            ws://HOST:FEED_PORT/storm_surge  storm surge risk   storm_surge_live.py, reading
-                                                               DATA_DIR/coastal_flooding
+                                                               FLOODING_DIR
 
 All three feeds share one websocket port and are told apart by path, so a TLS proxy in
 front of the app (for https:// and wss://) needs just the HTTP port and FEED_PORT. Any
-other path is refused with 404 during the handshake.
+other path is refused with 404 during the handshake. Behind such a proxy, --feed-url (or
+FEED_URL) is where browsers open the feeds instead, e.g. wss://example.cloudfront.net:
+/api/config passes it on, and the page adds each feed's path.
 
 The terrain and building tiles are too large for the repo, so a public copy is on S3
 (with a CORS rule allowing GET from any origin). When a folder hasn't been built
@@ -49,6 +51,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import threading
 from datetime import datetime, timedelta, timezone
 from functools import partial
@@ -60,6 +63,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 import duckdb
 from websockets.asyncio.server import serve
 
+import storage
 from ais_consumer import ANALYSIS_DIR, CRS, EXTENT_PATH, VESSELS_PATH
 from ais_live import live_positions
 from load_rasters import CD_TO_CGVD2013, DATA_DIR
@@ -112,9 +116,9 @@ def extent_bbox(extent_path=EXTENT_PATH):
         con.close()
 
 
-def app_config(bbox, feed_port=FEED_PORT):
+def app_config(bbox, feed_port=FEED_PORT, feed_url=None):
     return {"extent": bbox, "station": STATION_CODE,
-            "feed_port": feed_port, "feeds": FEED_PATHS,
+            "feed_port": feed_port, "feed_url": feed_url, "feeds": FEED_PATHS,
             "datums": {"chart_datum_cgvd2013": CHART_DATUM_CGVD2013,
                        "cgvd2013_to_wgs84": CGVD2013_TO_WGS84}}
 
@@ -122,19 +126,20 @@ def app_config(bbox, feed_port=FEED_PORT):
 def replay_days(today, days=REPLAY_DAYS, analysis_dir=ANALYSIS_DIR, vessels_path=VESSELS_PATH):
     """Berth occupancy for the `days` UTC days up to today, oldest first (see the docstring)."""
     dates = [str(today - timedelta(days=i)) for i in reversed(range(days))]
-    paths = [p for d in dates if (p := analysis_dir / f"date={d}" / "analysis.parquet").exists()]
+    paths = {d: p for d in dates
+             if storage.exists(p := storage.join(analysis_dir, f"date={d}", "analysis.parquet"))}
     by_date = {d: [] for d in dates}
     if paths:
-        vessels = (f"read_parquet('{vessels_path}')" if vessels_path.exists() else NO_VESSELS)
-        con = duckdb.connect()
+        vessels = f"read_parquet('{vessels_path}')" if storage.exists(vessels_path) else NO_VESSELS
+        con = storage.connect(analysis_dir, vessels_path)
         try:
             rows = con.execute(REPLAY.format(vessels=vessels),
-                               {"paths": [str(p) for p in paths]}).fetchall()
+                               {"paths": [str(p) for p in paths.values()]}).fetchall()
         finally:
             con.close()
         for date, *row in rows:
             by_date[date].append(dict(zip(REPLAY_FIELDS, row)))
-    analysed = {p.parent.name.removeprefix("date=") for p in paths}
+    analysed = paths.keys()
     return {"days": [{"date": d, "analysed": d in analysed, "vessels": by_date[d]}
                      for d in dates]}
 
@@ -230,9 +235,10 @@ async def serve_feeds(host, port, feeds):
         await asyncio.gather(*(poll() for _, poll in feeds.values()))
 
 
-async def serve_twin(host=HOST, http_port=HTTP_PORT, feed_port=FEED_PORT, remote=REMOTE):
+async def serve_twin(host=HOST, http_port=HTTP_PORT, feed_port=FEED_PORT, remote=REMOTE,
+                     feed_url=None):
     """Serve the app over HTTP and the three feeds over one websocket port until cancelled."""
-    server = start_http(host, http_port, config=app_config(extent_bbox(), feed_port),
+    server = start_http(host, http_port, config=app_config(extent_bbox(), feed_port, feed_url),
                         remote=remote)
     log.info("twin app on http://%s:%d", host, http_port)
     feeds = {FEED_PATHS["vessels"]: live_positions(),
@@ -250,12 +256,15 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=HTTP_PORT, help="HTTP port for the app")
     parser.add_argument("--feed-port", type=int, default=FEED_PORT,
                         help="websocket port for the three feeds")
+    parser.add_argument("--feed-url", default=os.environ.get("FEED_URL"),
+                        help="where browsers open the feeds when behind a proxy, "
+                             "e.g. wss://example.cloudfront.net (default: FEED_URL)")
     parser.add_argument("--no-s3", action="store_true",
                         help="load terrain and buildings only from DATA_DIR, never from S3")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
         asyncio.run(serve_twin(args.host, args.port, args.feed_port,
-                               remote={} if args.no_s3 else REMOTE))
+                               remote={} if args.no_s3 else REMOTE, feed_url=args.feed_url))
     except KeyboardInterrupt:
         pass

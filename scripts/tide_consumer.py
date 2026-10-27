@@ -3,7 +3,7 @@ Poll the CHS IWLS API for the current tide level at Halifax (station 00490) and
 store each reading as Parquet, written with DuckDB.
 
   Source   https://api-iwls.dfo-mpo.gc.ca/api/v1 (no key needed)
-  Output   DATA_DIR/tide/levels/levels_YYYY-MM-DD.parquet, one file per UTC day
+  Output   TIDE_DIR/levels/levels_YYYY-MM-DD.parquet, one file per UTC day
            ts, date, time, tide_level, series, qc_flag, fetched_at
 
 IWLS is a plain HTTP API, so this polls rather than streams. Every POLL_SECONDS
@@ -19,12 +19,16 @@ empty since late 2025, so expect wlp rows until the gauge reports again.
   qc_flag         IWLS quality control flag, e.g. '1' good, '2' not evaluated
   fetched_at      when the reading was fetched, UTC
 
-The day's file is rewritten on each new reading, via a temporary file so readers
-never see a half-written one. A reading already stored (same ts) is skipped, so
+The day's file is rewritten on each new reading, whole, so readers never see a
+half-written one. A reading already stored (same ts) is skipped, so
 a gauge that falls behind does not create duplicates. Read everything back with
-  SELECT * FROM read_parquet('DATA_DIR/tide/levels/*.parquet') ORDER BY ts
+  SELECT * FROM read_parquet('TIDE_DIR/levels/*.parquet') ORDER BY ts
 
-Needs duckdb (pip install duckdb). Stop with Ctrl+C or SIGTERM.
+TIDE_DIR is DATA_DIR/tide, or an S3 prefix such as s3://kieser-public/tide when
+the TIDE_DIR environment variable says so (see storage.py). On AWS Lambda,
+poll_handler does one poll per invocation instead of looping (see deploy/).
+
+Needs duckdb (pip install duckdb, and boto3 for S3). Stop with Ctrl+C or SIGTERM.
 """
 
 import argparse
@@ -37,11 +41,10 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 
-import duckdb
+import storage
+from storage import TIDE_DIR
 
-from load_rasters import DATA_DIR
-
-LEVELS_DIR = DATA_DIR / "tide" / "levels"
+LEVELS_DIR = storage.join(TIDE_DIR, "levels")
 
 IWLS_URL = "https://api-iwls.dfo-mpo.gc.ca/api/v1"
 STATION_CODE = "00490"       # Halifax
@@ -98,25 +101,32 @@ def latest_reading(station, now, base_url=IWLS_URL, lookback=LOOKBACK):
 
 def store_reading(row, out_dir=LEVELS_DIR):
     """Add a reading to its day's file. Returns False if that ts was already stored."""
-    path = out_dir / f"levels_{row[1]}.parquet"
-    tmp = path.with_suffix(".parquet.tmp")
-    con = duckdb.connect()
+    path = storage.join(out_dir, f"levels_{row[1]}.parquet")
+    con = storage.connect(path, spatial=False)
     try:
-        con.execute("SET TimeZone = 'UTC'")
         con.execute(f"CREATE TABLE levels ({COLUMNS})")
-        if path.exists():
+        if storage.exists(path):
             con.execute(f"INSERT INTO levels SELECT * FROM read_parquet('{path}')")
         if con.execute("SELECT count(*) FROM levels WHERE ts = ?", [row[0]]).fetchone()[0]:
             return False
         con.execute(f"INSERT INTO levels VALUES ({', '.join('?' * 7)})", row)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        con.execute(f"""
-            COPY (SELECT * FROM levels ORDER BY ts)
-            TO '{tmp}' (FORMAT parquet, COMPRESSION zstd)""")
+        storage.copy_to(con, "SELECT * FROM levels ORDER BY ts", path,
+                        "FORMAT parquet, COMPRESSION zstd")
     finally:
         con.close()
-    tmp.replace(path)
     return True
+
+
+def poll_once(station, out_dir=LEVELS_DIR, base_url=IWLS_URL):
+    """Fetch and store the latest reading. Returns it, or None if there was none."""
+    row = latest_reading(station, datetime.now(timezone.utc), base_url)
+    if row is None:
+        log.warning("no %s readings in the last %s", " or ".join(TIME_SERIES), LOOKBACK)
+    elif store_reading(row, out_dir):
+        log.info("stored %s %.3f m (%s)", iso_utc(row[0]), row[3], row[4])
+    else:
+        log.info("no new reading since %s", iso_utc(row[0]))
+    return row
 
 
 def poll(station, stop, out_dir=LEVELS_DIR, base_url=IWLS_URL, poll_seconds=POLL_SECONDS):
@@ -124,17 +134,23 @@ def poll(station, stop, out_dir=LEVELS_DIR, base_url=IWLS_URL, poll_seconds=POLL
     while not stop.is_set():
         started = time.monotonic()
         try:
-            row = latest_reading(station, datetime.now(timezone.utc), base_url)
+            poll_once(station, out_dir, base_url)
         except (OSError, ValueError, KeyError) as exc:  # network, bad JSON, odd payload
             log.warning("fetch failed, retrying next poll: %s", exc)
-        else:
-            if row is None:
-                log.warning("no %s readings in the last %s", " or ".join(TIME_SERIES), LOOKBACK)
-            elif store_reading(row, out_dir):
-                log.info("stored %s %.3f m (%s)", iso_utc(row[0]), row[3], row[4])
-            else:
-                log.info("no new reading since %s", iso_utc(row[0]))
         stop.wait(poll_seconds - (time.monotonic() - started))
+
+
+_station = {}   # IWLS id per station code, kept while a Lambda instance stays warm
+
+
+def poll_handler(event, context):
+    """AWS Lambda entry point, run every POLL_SECONDS: one poll of STATION_CODE.
+    A failed fetch raises, so the invocation shows as an error; the next one retries."""
+    logging.getLogger().setLevel(logging.INFO)
+    if STATION_CODE not in _station:
+        _station[STATION_CODE] = station_id(STATION_CODE)
+    row = poll_once(_station[STATION_CODE], LEVELS_DIR)
+    return {"ts": iso_utc(row[0]), "tide_level": row[3], "series": row[4]} if row else None
 
 
 if __name__ == "__main__":

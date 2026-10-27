@@ -157,6 +157,18 @@ class TestStore(unittest.TestCase):
         latest = read_latest(self.latest_path)
         self.assertEqual(read_snapshot(self.out_dir / latest["snapshot"]), [("33226bba", 2)])
 
+    def test_lambda_handler_polls_once(self):
+        fetch = lambda url: {"features": [risk_feature(*INSIDE)], "links": []}
+        with (mock.patch.object(storm_surge_consumer, "fetch_json", fetch),
+              mock.patch.object(storm_surge_consumer, "SNAPSHOTS_DIR", self.out_dir),
+              mock.patch.object(storm_surge_consumer, "LATEST_PATH", self.latest_path),
+              mock.patch.object(storm_surge_consumer, "_store", [])):
+            result = storm_surge_consumer.poll_handler({}, None)
+            self.assertEqual(result["features"], 1)
+            self.assertEqual(storm_surge_consumer.poll_handler({}, None), result)   # unchanged
+            storm_surge_consumer._store[0].close()
+        self.assertEqual(read_snapshot(self.out_dir / result["snapshot"]), [("33226bba", 2)])
+
 
 if __name__ == "__main__":
     unittest.main()

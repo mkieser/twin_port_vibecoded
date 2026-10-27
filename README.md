@@ -40,13 +40,18 @@ scripts/
   export_buildings_3dtiles.py   3D solids -> Cesium 3D Tiles
   ais_consumer.py               live AIS from aisstream.io -> GeoParquet, plus berth analysis
   ais_live.py                   websocket feed of the latest vessel positions
+  storage.py                    live data in local folders or on S3 (AIS_DIR, TIDE_DIR, ...)
   tide_consumer.py              CHS IWLS tide level -> Parquet every 5 minutes
   tide_live.py                  websocket feed of the latest tide level and trend
   storm_surge_consumer.py       MSC coastal flooding risk index -> GeoParquet every 30 minutes
   storm_surge_live.py           websocket feed of the current storm surge risk
   twin_app.py                   serves the CesiumJS app, terrain, tiles and the three feeds
-  twin_app/                     the app: index.html, app.js, style.css
+  twin_app/                     the app: index.html, app.js, style.css (vercel.json from deploy.sh)
   test_*.py                     unit tests (python -m unittest)
+deploy/
+  Dockerfile                    one image for the consumers and the twin app (ECS, Lambda, EC2)
+  template.yaml                 CloudFormation: Fargate, Lambdas, the EC2 twin app, CloudFront
+  deploy.sh                     build, push to ECR and deploy the stack
 ```
 
 ## Setup
@@ -119,9 +124,73 @@ all on port 8765 at `/vessels`, `/tide` and `/storm_surge` (`--port` and `--feed
 the two ports). Each feed can also run on its own, for example `python tide_live.py`.
 `--no-s3` loads terrain and buildings only from `DATA_DIR`.
 
-Behind HTTPS, the page connects to the feeds with `wss://` on the same host. Put a TLS proxy
-(nginx, Caddy and so on) in front of both ports, 8000 and 8765, and let it pass websocket
-upgrades through on 8765.
+**Reading the live data from S3.** By default the consumers write to `DATA_DIR/ais`,
+`DATA_DIR/tide` and `DATA_DIR/coastal_flooding`. Set `AIS_DIR`, `TIDE_DIR` and `FLOODING_DIR`
+to S3 prefixes to have the consumers, the feeds and the app use those instead, with your usual
+AWS credentials:
+
+```bash
+AWS_PROFILE=personal AIS_DIR=s3://kieser-public/ais TIDE_DIR=s3://kieser-public/tide \
+  FLOODING_DIR=s3://kieser-public/coastal_flooding python twin_app.py
+```
+
+### Running on AWS
+
+[deploy/](deploy/) runs the live data on AWS, writing to `s3://kieser-public`:
+
+| What | Where | Data |
+|---|---|---|
+| `ais_consumer.py` | ECS Fargate, one task, always on | `ais/` |
+| `ais_consumer.compact_handler` | Lambda, daily at 00:30 UTC | `ais/` |
+| `tide_consumer.poll_handler` | Lambda, every 5 minutes | `tide/` |
+| `storm_surge_consumer.poll_handler` | Lambda, every 30 minutes | `coastal_flooding/` |
+| `twin_app.py` (API and feeds) | EC2 `t3.small` behind CloudFront | reads all three |
+| The page (`twin_app/`) | Vercel, https://twinportvibecoded-twinapp.vercel.app/ | none |
+
+All of them run the same image. The AIS consumer isn't on Lambda because the aisstream.io
+websocket stays open indefinitely and Lambda stops after 15 minutes. The tide and storm surge
+consumers only poll every 5 or 30 minutes, so each Lambda run does one poll and exits.
+
+Start Docker, then run this with credentials for the account that owns the bucket. Set the
+key the first time only; it is kept in Secrets Manager:
+
+```bash
+AWS_PROFILE=... AISSTREAM_API_KEY=... ./deploy/deploy.sh
+```
+
+The script builds the image, pushes it to ECR and deploys the CloudFormation stack
+`ais-3d-port` in us-east-1, in the default VPC's subnets (or the only VPC, if none is
+default; otherwise set `VPC_ID` and `SUBNET_IDS`). Run it again after changing the code.
+Logs are in the `/3d-port/ais`, `/3d-port/tide`, `/3d-port/storm-surge` and `/3d-port/twin` log
+groups. A
+deploy stops the old AIS task before starting the new one, so two consumers never write at
+once; positions are missed for about a minute. Stop any local consumers writing to the same
+S3 prefixes.
+
+**The twin app.** Vercel serves the page but can't run `twin_app.py` or forward
+websockets, so:
+- **The app:** `twin_app.py` runs in Docker on an EC2 instance with an Elastic IP, started by a
+  systemd unit (`twin`) that pulls the image named in the SSM parameter `/3d-port/twin-image`.
+- **CloudFront:** a distribution in front of it gives `https://` and `wss://` without a domain
+  of our own. It forwards the feed paths to port 8001 and everything else to 8000. The
+  instance accepts connections only from CloudFront.
+- **The page:** Vercel forwards the page's `/api/*` requests to CloudFront, through the
+  rewrite in `scripts/twin_app/vercel.json`. `/api/config` gives the feeds' address,
+  `wss://<distribution>.cloudfront.net` (`twin_app.py --feed-url`, or `FEED_URL`), and the
+  page opens them there.
+
+The script ends by printing the CloudFront URL, which also serves the whole app by itself. It
+writes `vercel.json` with that URL; commit and push it so Vercel redeploys the page with the
+rewrite. This assumes the Vercel project's root directory is `scripts/twin_app`.
+
+After the first deploy, the script restarts `twin_app.py` on the new image through SSM Run
+Command. A newer Amazon Linux AMI replaces the instance on the next deploy, which is how it
+gets OS updates; the app is down for a few minutes then. For a shell on the instance, run
+`aws ssm start-session --target <instance id>`; it has no SSH key.
+
+Behind HTTPS elsewhere, put a TLS proxy (nginx, Caddy and so on) in front of both ports,
+8000 and 8765, and let it pass websocket upgrades through on 8765. Pass `--feed-url` if the
+feeds aren't at `wss://` on the page's own host and port 8765.
 
 **Tests:**
 
@@ -209,12 +278,16 @@ are stored with `CESIUM_primitive_outline`, so Cesium can draw outlines.
 
 **[ais_consumer.py](scripts/ais_consumer.py)** subscribes to aisstream.io for the extent's
 bounding box and clips positions exactly to the extent polygon.
-- **Positions:** flushed every 60 s as date-partitioned GeoParquet to `DATA_DIR/ais/positions/`.
+- **Positions:** flushed every 60 s as date-partitioned GeoParquet to `AIS_DIR/positions/`.
 - **Ship types:** each vessel's latest type, call sign and IMO number, from the static data
-  messages, go to `DATA_DIR/ais/vessels.parquet`.
+  messages, go to `AIS_DIR/vessels.parquet`.
 - **`--compact`:** merges one day's position files into a single file and writes berth
-  occupancy to `DATA_DIR/ais/analysis_daily/`: one row per vessel and berth, counting the clock
-  hours the vessel was moored in that berth (speed under 1 kn).
+  occupancy to `AIS_DIR/analysis_daily/`: one row per vessel and berth, counting the clock
+  hours the vessel was moored in that berth (speed under 1 kn). On AWS, Lambda runs it as
+  `compact_handler`.
+
+`AIS_DIR` is `DATA_DIR/ais`, or the S3 prefix in the `AIS_DIR` environment variable
+([storage.py](scripts/storage.py)). `TIDE_DIR` and `FLOODING_DIR` below work the same way.
 
 **[ais_live.py](scripts/ais_live.py)** sends each vessel's latest position from the last
 10 minutes of position files, with its ship type, as a GeoJSON FeatureCollection whenever a new
@@ -222,7 +295,7 @@ file appears.
 
 **[tide_consumer.py](scripts/tide_consumer.py)** polls the CHS IWLS API for station 00490 every
 5 minutes. It stores the latest observed level (`wlo`), or the predicted level (`wlp`) when the
-gauge has no recent data, in one Parquet file per day under `DATA_DIR/tide/levels/`. Each row has
+gauge has no recent data, in one Parquet file per day under `TIDE_DIR/levels/`. Each row has
 `ts`, `date`, `time`, `tide_level`, `series`, `qc_flag` and `fetched_at`. A reading that's already
 stored is skipped.
 
@@ -233,7 +306,7 @@ stored is skipped.
 **[storm_surge_consumer.py](scripts/storm_surge_consumer.py)** polls the MSC GeoMet
 `coastal-flooding-risk-index` collection every 30 minutes.
 - **Clipping:** keeps the risk cells that touch the extent polygon.
-- **Snapshots:** writes a GeoParquet snapshot to `DATA_DIR/coastal_flooding/risk_index/` only
+- **Snapshots:** writes a GeoParquet snapshot to `FLOODING_DIR/risk_index/` only
   when the set of features changes.
 - **`latest.json`:** records the current snapshot, or that there is no risk, after every poll.
 

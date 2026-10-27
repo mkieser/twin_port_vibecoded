@@ -4,9 +4,9 @@ the project extent as GeoParquet, written with DuckDB.
 
   Source   https://api.weather.gc.ca/collections/coastal-flooding-risk-index/items
   Extent   DATA_DIR/extent.gpkg  (EPSG:2961 polygon, the 10 km data square)
-  Output   DATA_DIR/coastal_flooding/risk_index/risk_index_YYYYMMDDTHHMMZ.parquet
+  Output   FLOODING_DIR/risk_index/risk_index_YYYYMMDDTHHMMZ.parquet
            GeoParquet 1.0, polygon geometry in EPSG:4326, one file per change
-  Current  DATA_DIR/coastal_flooding/latest.json, which snapshot is current
+  Current  FLOODING_DIR/latest.json, which snapshot is current
 
 The index does not give surge heights. Each feature is a grid cell polygon,
 issued daily by the Storm Prediction Centres for forecast periods out to 5 days,
@@ -39,9 +39,14 @@ latest.json is rewritten after every successful poll:
 
 The extent is usually empty: risk is only issued where flooding is possible.
 Read the history back with
-  SELECT * FROM read_parquet('DATA_DIR/coastal_flooding/risk_index/*.parquet')
+  SELECT * FROM read_parquet('FLOODING_DIR/risk_index/*.parquet')
 
-Needs duckdb (pip install duckdb). Stop with Ctrl+C or SIGTERM.
+FLOODING_DIR is DATA_DIR/coastal_flooding, or an S3 prefix such as
+s3://kieser-public/coastal_flooding when the FLOODING_DIR environment variable
+says so (see storage.py). On AWS Lambda, poll_handler does one poll per
+invocation instead of looping (see deploy/).
+
+Needs duckdb (pip install duckdb, and boto3 for S3). Stop with Ctrl+C or SIGTERM.
 """
 
 import argparse
@@ -53,15 +58,13 @@ import time
 from datetime import datetime, timezone
 from urllib.parse import urlencode
 
-import duckdb
-
+import storage
 from ais_consumer import CRS, EXTENT_PATH
-from load_rasters import DATA_DIR
+from storage import FLOODING_DIR
 from tide_consumer import fetch_json, iso_utc
 
-FLOODING_DIR = DATA_DIR / "coastal_flooding"
-SNAPSHOTS_DIR = FLOODING_DIR / "risk_index"
-LATEST_PATH = FLOODING_DIR / "latest.json"
+SNAPSHOTS_DIR = storage.join(FLOODING_DIR, "risk_index")
+LATEST_PATH = storage.join(FLOODING_DIR, "latest.json")
 
 ITEMS_URL = "https://api.weather.gc.ca/collections/coastal-flooding-risk-index/items"
 POLL_SECONDS = 1800
@@ -129,7 +132,7 @@ def fetch_features(bbox, url=ITEMS_URL):
 
 def read_latest(latest_path=LATEST_PATH):
     """latest.json as a dict, or None before the first poll."""
-    return json.loads(latest_path.read_text()) if latest_path.exists() else None
+    return json.loads(storage.read_text(latest_path)) if storage.exists(latest_path) else None
 
 
 class RiskIndexStore:
@@ -138,8 +141,7 @@ class RiskIndexStore:
     def __init__(self, extent_path=EXTENT_PATH, out_dir=SNAPSHOTS_DIR, latest_path=LATEST_PATH):
         self.out_dir = out_dir
         self.latest_path = latest_path
-        self.con = duckdb.connect()
-        self.con.execute("INSTALL spatial; LOAD spatial; SET TimeZone = 'UTC'")
+        self.con = storage.connect(out_dir, latest_path)
         self.con.execute(f"CREATE TABLE staging ({STAGING_COLUMNS})")
         self.con.execute(
             "CREATE TABLE extent AS SELECT ST_Union_Agg(geom) AS geom FROM ST_Read(?)",
@@ -174,21 +176,35 @@ class RiskIndexStore:
         if features != latest["features"]:
             latest["snapshot"] = None
             if features:
-                written = self.out_dir / f"risk_index_{fetched_at:%Y%m%dT%H%MZ}.parquet"
-                tmp = written.with_suffix(".parquet.tmp")  # readers never see a half-written file
-                self.out_dir.mkdir(parents=True, exist_ok=True)
-                self.con.execute(f"COPY batch TO '{tmp}' (FORMAT parquet, COMPRESSION zstd)")
-                tmp.replace(written)
-                latest["snapshot"] = written.name
+                written = storage.join(self.out_dir,
+                                       f"risk_index_{fetched_at:%Y%m%dT%H%MZ}.parquet")
+                storage.copy_to(self.con, "SELECT * FROM batch", written,
+                                "FORMAT parquet, COMPRESSION zstd")
+                latest["snapshot"] = storage.basename(written)
         latest.update(fetched_at=iso_utc(fetched_at), features=features)
-        self.latest_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.latest_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(latest))
-        tmp.replace(self.latest_path)
+        storage.write_text(self.latest_path, json.dumps(latest))
         return written
 
     def close(self):
         self.con.close()
+
+
+def poll_once(store, bbox, url=ITEMS_URL):
+    """Fetch and store the extent's risk index once. Returns latest.json as a dict."""
+    fetched_at = datetime.now(timezone.utc)
+    features = fetch_features(bbox, url)
+    rows = [row for row in (parse_feature(f, fetched_at) for f in features) if row]
+    written = store.save(rows, fetched_at)
+    latest = read_latest(store.latest_path)
+    if written:
+        log.info("wrote %s, %d features in the extent", storage.basename(written),
+                 len(latest["features"]))
+    else:
+        log.info("%d features in the bbox, %d in the extent, %s", len(rows),
+                 len(latest["features"]),
+                 f"current snapshot {latest['snapshot']}" if latest["snapshot"]
+                 else "no flooding risk")
+    return latest
 
 
 def poll(store, stop, url=ITEMS_URL, poll_seconds=POLL_SECONDS):
@@ -196,24 +212,24 @@ def poll(store, stop, url=ITEMS_URL, poll_seconds=POLL_SECONDS):
     bbox = store.bbox()
     while not stop.is_set():
         started = time.monotonic()
-        fetched_at = datetime.now(timezone.utc)
         try:
-            features = fetch_features(bbox, url)
+            poll_once(store, bbox, url)
         except (OSError, ValueError, KeyError) as exc:  # network, bad JSON, odd payload
             log.warning("fetch failed, retrying next poll: %s", exc)
-        else:
-            rows = [row for row in (parse_feature(f, fetched_at) for f in features) if row]
-            written = store.save(rows, fetched_at)
-            latest = read_latest(store.latest_path)
-            if written:
-                log.info("wrote %s, %d features in the extent", written.name,
-                         len(latest["features"]))
-            else:
-                log.info("%d features in the bbox, %d in the extent, %s", len(rows),
-                         len(latest["features"]),
-                         f"current snapshot {latest['snapshot']}" if latest["snapshot"]
-                         else "no flooding risk")
         stop.wait(poll_seconds - (time.monotonic() - started))
+
+
+_store = []   # the RiskIndexStore, kept while a Lambda instance stays warm
+
+
+def poll_handler(event, context):
+    """AWS Lambda entry point, run every POLL_SECONDS: one poll. A failed fetch raises,
+    so the invocation shows as an error; the next one retries."""
+    logging.getLogger().setLevel(logging.INFO)
+    if not _store:
+        _store.append(RiskIndexStore(EXTENT_PATH, SNAPSHOTS_DIR, LATEST_PATH))
+    latest = poll_once(_store[0], _store[0].bbox())
+    return {"snapshot": latest["snapshot"], "features": len(latest["features"])}
 
 
 if __name__ == "__main__":
