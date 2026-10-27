@@ -1,6 +1,7 @@
 # Python 3.14. Versions are the ones the project was last tested with.
 duckdb>=1.5.6
 websockets>=17.3
+boto3>=1.43.0
 numpy>=2.5.4
 rasterio>=1.5.2
 geopandas>=1.2.0

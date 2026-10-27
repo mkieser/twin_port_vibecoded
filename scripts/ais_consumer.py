@@ -3,7 +3,7 @@ Consume live AIS positions from aisstream.io and store the ones inside the
 project extent as GeoParquet, written with DuckDB.
 
   Extent   DATA_DIR/extent.gpkg  (EPSG:2961 polygon, the 10 km data square)
-  Output   DATA_DIR/ais/positions/date=YYYY-MM-DD/positions_{uuid}.parquet
+  Output   AIS_DIR/positions/date=YYYY-MM-DD/positions_{uuid}.parquet
            GeoParquet 1.0, point geometry in EPSG:4326, plus the original
            lon/lat as plain columns.
 
@@ -16,28 +16,33 @@ stored as NULL.
 
 Position reports carry no ship type, so the static data messages are kept too,
 one row per vessel with its latest values, rewritten on each flush that has any:
-  Vessels  DATA_DIR/ais/vessels.parquet
+  Vessels  AIS_DIR/vessels.parquet
            mmsi, ship_type (AIS type code, e.g. 52 tug, 70-79 cargo), call_sign,
            imo, updated_at
 Class A vessels send theirs (ShipStaticData) every 6 minutes, class B ones
 (StaticDataReport part B) less often; type 0 ("not available") is stored as NULL.
 
 Read everything back with
-  SELECT * FROM read_parquet('DATA_DIR/ais/positions/**/*.parquet', hive_partitioning = true)
+  SELECT * FROM read_parquet('AIS_DIR/positions/**/*.parquet', hive_partitioning = true)
 
 compact_day merges one day's flush files into a single file in a separate folder,
 sorted by mmsi then ts so each vessel's track is contiguous:
-  Daily    DATA_DIR/ais/positions_daily/date=YYYY-MM-DD/positions.parquet
+  Daily    AIS_DIR/positions_daily/date=YYYY-MM-DD/positions.parquet
 analyze_day then reads that file and writes the day's berth occupancy, one row
 per vessel and berth (see analyze_day for the definitions):
-  Analysis DATA_DIR/ais/analysis_daily/date=YYYY-MM-DD/analysis.parquet
+  Analysis AIS_DIR/analysis_daily/date=YYYY-MM-DD/analysis.parquet
            mmsi, ship_name, berth_name, dwell_time (whole hours), lon, lat (EPSG:4326)
 Berths are the named polygons in DATA_DIR/berth.gpkg. Run both from the command
-line with --compact [YYYY-MM-DD] (default yesterday, UTC).
+line with --compact [YYYY-MM-DD] (default yesterday, UTC), or on AWS Lambda
+with compact_handler.
+
+AIS_DIR is DATA_DIR/ais, or an S3 prefix such as s3://kieser-public/ais when the
+AIS_DIR environment variable says so (see storage.py). deploy/ runs the consumer
+on ECS Fargate and compact_handler daily on Lambda, both writing to S3.
 
 Needs an aisstream.io API key in AISSTREAM_API_KEY, plus duckdb and websockets
-(pip install duckdb websockets). Stop with Ctrl+C or SIGTERM; the buffer is
-flushed on the way out.
+(pip install duckdb websockets, and boto3 for S3). Stop with Ctrl+C or SIGTERM;
+the buffer is flushed on the way out.
 """
 
 import argparse
@@ -50,18 +55,19 @@ import signal
 import time
 from datetime import date, datetime, timedelta, timezone
 
-import duckdb
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
 
+import storage
 from load_rasters import DATA_DIR
+from storage import AIS_DIR
 
 EXTENT_PATH = DATA_DIR / "extent.gpkg"
-POSITIONS_DIR = DATA_DIR / "ais" / "positions"
-DAILY_DIR = DATA_DIR / "ais" / "positions_daily"
+POSITIONS_DIR = storage.join(AIS_DIR, "positions")
+DAILY_DIR = storage.join(AIS_DIR, "positions_daily")
 BERTH_PATH = DATA_DIR / "berth.gpkg"
-ANALYSIS_DIR = DATA_DIR / "ais" / "analysis_daily"
-VESSELS_PATH = DATA_DIR / "ais" / "vessels.parquet"
+ANALYSIS_DIR = storage.join(AIS_DIR, "analysis_daily")
+VESSELS_PATH = storage.join(AIS_DIR, "vessels.parquet")
 CRS = "EPSG:2961"
 
 AISSTREAM_URL = "wss://stream.aisstream.io/v0/stream"
@@ -154,17 +160,16 @@ class PositionStore:
     def __init__(self, extent_path=EXTENT_PATH, out_dir=POSITIONS_DIR, vessels_path=None):
         self.out_dir = out_dir
         # VESSELS_PATH by default, i.e. beside the positions folder
-        self.vessels_path = vessels_path or out_dir.parent / VESSELS_PATH.name
+        self.vessels_path = vessels_path or storage.sibling(out_dir, storage.basename(VESSELS_PATH))
         self.rows, self.static_rows = [], []
         self.last_flush = time.monotonic()
-        self.con = duckdb.connect()
-        self.con.execute("INSTALL spatial; LOAD spatial; SET TimeZone = 'UTC'")
+        self.con = storage.connect(out_dir, self.vessels_path)
         self.con.execute(f"CREATE TABLE staging ({STAGING_COLUMNS})")
         self.con.execute(
             "CREATE TABLE extent AS SELECT ST_Union_Agg(geom) AS geom FROM ST_Read(?)",
             [str(extent_path)])
         self.con.execute(f"CREATE TABLE vessels ({VESSEL_COLUMNS})")
-        if self.vessels_path.exists():
+        if storage.exists(self.vessels_path):
             self.con.execute(
                 f"INSERT INTO vessels SELECT * FROM read_parquet('{self.vessels_path}')")
 
@@ -206,7 +211,8 @@ class PositionStore:
         self.con.execute("DELETE FROM staging")
         written = self.con.execute("SELECT count(*) FROM batch").fetchone()[0]
         if written:
-            self.out_dir.mkdir(parents=True, exist_ok=True)
+            if not storage.is_s3(self.out_dir):
+                self.out_dir.mkdir(parents=True, exist_ok=True)
             self.con.execute(f"""
                 COPY batch TO '{self.out_dir}'
                 (FORMAT parquet, COMPRESSION zstd, PARTITION_BY (date), APPEND,
@@ -219,10 +225,7 @@ class PositionStore:
         if not static_rows:
             return 0
         self.con.executemany("INSERT OR REPLACE INTO vessels VALUES (?, ?, ?, ?, ?)", static_rows)
-        tmp = self.vessels_path.with_suffix(".parquet.tmp")  # readers never see a half-written file
-        self.vessels_path.parent.mkdir(parents=True, exist_ok=True)
-        self.con.execute(f"COPY (SELECT * FROM vessels ORDER BY mmsi) TO '{tmp}' (FORMAT parquet)")
-        tmp.replace(self.vessels_path)
+        storage.copy_to(self.con, "SELECT * FROM vessels ORDER BY mmsi", self.vessels_path)
         return len(static_rows)
 
     def close(self):
@@ -237,22 +240,16 @@ def compact_day(day, src_dir=POSITIONS_DIR, out_dir=DAILY_DIR):
     Returns the number of rows merged, 0 if the day has no files.
     """
     day = date.fromisoformat(str(day))
-    if not any((src_dir / f"date={day}").glob("*.parquet")):
+    if not storage.list_files(storage.join(src_dir, f"date={day}"), ".parquet"):
         return 0
-    dst = out_dir / f"date={day}" / "positions.parquet"
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dst.with_suffix(".parquet.tmp")  # readers never see a half-written file
-    con = duckdb.connect()
+    dst = storage.join(out_dir, f"date={day}", "positions.parquet")
+    con = storage.connect(src_dir, dst)
     try:
-        con.execute("INSTALL spatial; LOAD spatial")
-        n_rows = con.execute(f"""
-            COPY (SELECT * FROM read_parquet('{src_dir}/date={day}/*.parquet')
-                  ORDER BY mmsi, ts)
-            TO '{tmp}' (FORMAT parquet, COMPRESSION zstd)""").fetchone()[0]
+        return storage.copy_to(con, f"""
+            SELECT * FROM read_parquet('{src_dir}/date={day}/*.parquet') ORDER BY mmsi, ts""",
+            dst, "FORMAT parquet, COMPRESSION zstd")
     finally:
         con.close()
-    tmp.replace(dst)
-    return n_rows
 
 
 def analyze_day(day, daily_dir=DAILY_DIR, berth_path=BERTH_PATH, out_dir=ANALYSIS_DIR):
@@ -273,41 +270,55 @@ def analyze_day(day, daily_dir=DAILY_DIR, berth_path=BERTH_PATH, out_dir=ANALYSI
     written if the day has no positions.parquet.
     """
     day = date.fromisoformat(str(day))
-    src = daily_dir / f"date={day}" / "positions.parquet"
-    if not src.exists():
+    src = storage.join(daily_dir, f"date={day}", "positions.parquet")
+    if not storage.exists(src):
         return 0
-    dst = out_dir / f"date={day}" / "analysis.parquet"
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dst.with_suffix(".parquet.tmp")
-    con = duckdb.connect()
+    dst = storage.join(out_dir, f"date={day}", "analysis.parquet")
+    con = storage.connect(src, dst)
     try:
-        con.execute("INSTALL spatial; LOAD spatial; SET TimeZone = 'UTC'")
         # The geometry column is named by whoever wrote the GeoPackage (geom, geometry, ...)
         geom = con.execute("""
             SELECT column_name FROM (DESCRIBE SELECT * FROM ST_Read(?))
             WHERE column_type LIKE 'GEOMETRY%'""", [str(berth_path)]).fetchone()[0]
-        n_rows = con.execute(f"""
-            COPY (
-                WITH berth AS (SELECT name, "{geom}" AS geom FROM ST_Read('{berth_path}')),
-                pos AS (SELECT * FROM read_parquet('{src}')),
-                names AS (SELECT mmsi, mode(ship_name) AS ship_name FROM pos GROUP BY mmsi),
-                moored AS (
-                    SELECT p.mmsi, b.name AS berth_name, p.ts, p.lon, p.lat
-                    FROM pos p JOIN berth b ON ST_Within(
-                        ST_Transform(ST_Point(p.lon, p.lat), 'EPSG:4326', '{CRS}',
-                                     always_xy := true), b.geom)
-                    WHERE p.sog IS NULL OR p.sog < {MOORED_SOG})
-                SELECT mmsi, n.ship_name, berth_name,
-                       CAST(count(DISTINCT hour(ts)) AS INTEGER) AS dwell_time,
-                       avg(lon) AS lon, avg(lat) AS lat
-                FROM moored JOIN names n USING (mmsi)
-                GROUP BY ALL
-                ORDER BY berth_name, mmsi)
-            TO '{tmp}' (FORMAT parquet, COMPRESSION zstd)""").fetchone()[0]
+        return storage.copy_to(con, f"""
+            WITH berth AS (SELECT name, "{geom}" AS geom FROM ST_Read('{berth_path}')),
+            pos AS (SELECT * FROM read_parquet('{src}')),
+            names AS (SELECT mmsi, mode(ship_name) AS ship_name FROM pos GROUP BY mmsi),
+            moored AS (
+                SELECT p.mmsi, b.name AS berth_name, p.ts, p.lon, p.lat
+                FROM pos p JOIN berth b ON ST_Within(
+                    ST_Transform(ST_Point(p.lon, p.lat), 'EPSG:4326', '{CRS}',
+                                 always_xy := true), b.geom)
+                WHERE p.sog IS NULL OR p.sog < {MOORED_SOG})
+            SELECT mmsi, n.ship_name, berth_name,
+                   CAST(count(DISTINCT hour(ts)) AS INTEGER) AS dwell_time,
+                   avg(lon) AS lon, avg(lat) AS lat
+            FROM moored JOIN names n USING (mmsi)
+            GROUP BY ALL
+            ORDER BY berth_name, mmsi""", dst, "FORMAT parquet, COMPRESSION zstd")
     finally:
         con.close()
-    tmp.replace(dst)
-    return n_rows
+
+
+def compact(day):
+    """compact_day then analyze_day for one UTC day. Returns both row counts."""
+    n_positions = compact_day(day)
+    log.info("merged %d positions for %s into %s", n_positions, day, DAILY_DIR)
+    n_occupancies = analyze_day(day)
+    log.info("found %d vessel berth occupancies, written to %s", n_occupancies, ANALYSIS_DIR)
+    return n_positions, n_occupancies
+
+
+def yesterday():
+    return str(datetime.now(timezone.utc).date() - timedelta(days=1))
+
+
+def compact_handler(event, context):
+    """AWS Lambda entry point: compact {"day": "YYYY-MM-DD"}, by default yesterday (UTC)."""
+    logging.getLogger().setLevel(logging.INFO)
+    day = (event or {}).get("day") or yesterday()
+    n_positions, n_occupancies = compact(day)
+    return {"day": day, "positions": n_positions, "occupancies": n_occupancies}
 
 
 def subscription(api_key, bbox):
@@ -371,17 +382,13 @@ async def main(url, api_key):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--url", default=AISSTREAM_URL)
-    parser.add_argument("--compact", nargs="?", metavar="YYYY-MM-DD",
-                        const=str(datetime.now(timezone.utc).date() - timedelta(days=1)),
+    parser.add_argument("--compact", nargs="?", metavar="YYYY-MM-DD", const=yesterday(),
                         help="merge one day's files into DAILY_DIR, analyze berth "
                              "occupancy into ANALYSIS_DIR and exit (default yesterday, UTC)")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if args.compact:
-        n_rows = compact_day(args.compact)
-        print(f"Merged {n_rows:,} positions for {args.compact} into {DAILY_DIR}")
-        n_rows = analyze_day(args.compact)
-        print(f"Found {n_rows:,} vessel berth occupancies, written to {ANALYSIS_DIR}")
+        compact(args.compact)
         raise SystemExit
     api_key = os.environ.get("AISSTREAM_API_KEY")
     if not api_key:

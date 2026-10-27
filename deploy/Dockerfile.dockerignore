@@ -1,0 +1,17 @@
+# Send only what the image needs; data/ holds gigabytes of rasters and tiles
+*
+!deploy/requirements.txt
+!data/extent.gpkg
+!data/berth.gpkg
+!scripts/ais_consumer.py
+!scripts/storage.py
+!scripts/load_rasters.py
+!scripts/tide_consumer.py
+!scripts/tide_live.py
+!scripts/storm_surge_consumer.py
+!scripts/ais_live.py
+!scripts/storm_surge_live.py
+!scripts/twin_app.py
+!scripts/twin_app/index.html
+!scripts/twin_app/app.js
+!scripts/twin_app/style.css

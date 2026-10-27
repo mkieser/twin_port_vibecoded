@@ -107,6 +107,16 @@ class TestStore(unittest.TestCase):
             poll(STATION, stop, self.out_dir, poll_seconds=0.01)
         self.assertEqual(read_levels(self.out_dir), [1.40])
 
+    def test_lambda_handler_polls_once(self):
+        fetch, urls = fake_api(wlp=[item("2026-10-21T19:25:00Z", 1.38)])
+        with (mock.patch.object(tide_consumer, "fetch_json", fetch),
+              mock.patch.object(tide_consumer, "LEVELS_DIR", self.out_dir),
+              mock.patch.dict(tide_consumer._station, {tide_consumer.STATION_CODE: STATION})):
+            self.assertEqual(tide_consumer.poll_handler({}, None),
+                             {"ts": "2026-10-21T19:25:00Z", "tide_level": 1.38, "series": "wlp"})
+        self.assertEqual(len(urls), 2)   # wlo, then wlp
+        self.assertEqual(read_levels(self.out_dir), [1.38])
+
 
 if __name__ == "__main__":
     unittest.main()

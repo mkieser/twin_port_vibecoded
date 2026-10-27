@@ -1,17 +1,18 @@
 """
 Push live vessel positions to browsers over a websocket.
 
-  Input    the most recent files in DATA_DIR/ais/positions (from ais_consumer.py)
+  Input    the most recent files in AIS_DIR/positions (from ais_consumer.py), a local
+           folder or S3 (see storage.py)
   Output   ws://HOST:PORT, one GeoJSON FeatureCollection per new file
 
 The positions folder is polled every POLL_SECONDS. When a newer .parquet file
 appears (the consumer writes one per flush), it and every file written up to
-WINDOW_SECONDS before it are read, so moored ships that report only every few
+WINDOW_SECONDS before it are read (only the newest date folders are listed), so moored ships that report only every few
 minutes stay in the feed. Each vessel's latest position across those files is
 broadcast to every connected browser as a GeoJSON FeatureCollection: Point
 geometry in lon/lat, properties mmsi, ship_name, ship_type, ts (ISO 8601 UTC),
 sog, cog, heading and nav_status. ship_type is the AIS type code from
-DATA_DIR/ais/vessels.parquet, null until the vessel's static data has arrived.
+AIS_DIR/vessels.parquet, null until the vessel's static data has arrived.
 A browser that connects gets the current positions straight away, then each
 update. The twin app (twin_app.py) shows them on its Live panel.
 
@@ -22,7 +23,7 @@ To use the feed elsewhere, e.g. in Cesium:
     await vessels.load(JSON.parse(e.data));   // vessels: a Cesium.GeoJsonDataSource
   };
 
-Needs duckdb and websockets (pip install duckdb websockets).
+Needs duckdb and websockets (pip install duckdb websockets, and boto3 for S3).
 """
 
 import asyncio
@@ -32,6 +33,7 @@ import logging
 import duckdb
 from websockets.asyncio.server import broadcast, serve
 
+import storage
 from ais_consumer import POSITIONS_DIR, VESSELS_PATH
 
 HOST = "localhost"
@@ -57,18 +59,25 @@ def recent_files(positions_dir=POSITIONS_DIR, window_seconds=WINDOW_SECONDS):
     """Positions files written within window_seconds of the newest one, newest first.
 
     The window is relative to the newest file, not the clock, so the last known
-    positions are still served if the consumer stops.
+    positions are still served if the consumer stops. Date folders are listed newest
+    first, stopping at the first one that reaches back past the window, so a long
+    history (or an S3 bucket) isn't listed on every poll.
     """
-    files = sorted(((f.stat().st_mtime, f) for f in positions_dir.glob("date=*/*.parquet")),
-                   reverse=True)
+    files = []
+    for folder in sorted(storage.subdirs(positions_dir, "date="), key=str, reverse=True):
+        in_folder = storage.list_files(folder, ".parquet")
+        files += in_folder
+        if in_folder and min(in_folder)[0] < max(files)[0] - window_seconds:
+            break
     if not files:
         return []
+    files.sort(key=lambda f: f[0], reverse=True)
     return [f for mtime, f in files if mtime >= files[0][0] - window_seconds]
 
 
 def positions_geojson(con, paths, vessels_path=VESSELS_PATH):
     """Each vessel's latest position across positions files, as a GeoJSON FeatureCollection."""
-    vessels = (f"read_parquet('{vessels_path}')" if vessels_path.exists() else NO_VESSELS)
+    vessels = f"read_parquet('{vessels_path}')" if storage.exists(vessels_path) else NO_VESSELS
     rows = con.execute(LATEST_POSITIONS.format(vessels=vessels),
                        {"paths": [str(p) for p in paths]}).fetchall()
     return {"type": "FeatureCollection", "features": [
@@ -84,9 +93,8 @@ def live_positions(positions_dir=POSITIONS_DIR, poll_seconds=POLL_SECONDS, vesse
 
     vessels_path defaults to vessels.parquet beside positions_dir, as the consumer writes it.
     """
-    vessels_path = vessels_path or positions_dir.parent / VESSELS_PATH.name
-    con = duckdb.connect()
-    con.execute("SET TimeZone = 'UTC'")
+    vessels_path = vessels_path or storage.sibling(positions_dir, storage.basename(VESSELS_PATH))
+    con = storage.connect(positions_dir, vessels_path)
     current = {"file": None, "message": None}
     clients = set()
 
@@ -107,7 +115,7 @@ def live_positions(positions_dir=POSITIONS_DIR, poll_seconds=POLL_SECONDS, vesse
                 try:
                     collection = positions_geojson(con, paths, vessels_path)
                 except duckdb.Error as exc:  # e.g. the consumer is still writing one
-                    log.warning("skipping %s for now: %s", paths[0].name, exc)
+                    log.warning("skipping %s for now: %s", storage.basename(paths[0]), exc)
                 else:
                     current.update(file=paths[0], message=json.dumps(collection))
                     broadcast(clients, current["message"])

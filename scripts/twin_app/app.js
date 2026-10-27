@@ -94,13 +94,19 @@ const tooltips = new WeakMap();  // entity -> () => html
 
 // --- Feeds ---------------------------------------------------------------------------------
 
-// All feeds share one port and are told apart by path, e.g. ws://host:8765/tide
-function feed(port, path, onMessage, onState = () => {}) {
+// All feeds share one port and are told apart by path, e.g. ws://host:8765/tide, or
+// config.feed_url's path when they are behind a proxy, e.g. wss://example.cloudfront.net/tide
+function feedBase() {
+  if (config.feed_url) return config.feed_url.replace(/\/$/, "");
+  // wss:// when the page itself came over HTTPS (browsers block ws:// from https pages)
+  const scheme = location.protocol === "https:" ? "wss" : "ws";
+  return `${scheme}://${location.hostname || "localhost"}:${config.feed_port}`;
+}
+
+function feed(path, onMessage, onState = () => {}) {
   let retryMs = 1000;
   const open = () => {
-    // wss:// when the page itself came over HTTPS (browsers block ws:// from https pages)
-    const scheme = location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(`${scheme}://${location.hostname || "localhost"}:${port}${path}`);
+    const ws = new WebSocket(`${feedBase()}${path}`);
     ws.onopen = () => { retryMs = 1000; onState("live"); };
     ws.onmessage = (e) => onMessage(JSON.parse(e.data));
     ws.onclose = () => {
@@ -134,8 +140,8 @@ function renderVesselStatus() {
   if (f.state === "down") {
     state = "down";
     text = "Ship feed not reachable";
-    hint = `Retrying in ${f.retryMs / 1000} s. twin_app.py serves it on port ${config.feed_port}, `
-      + `path ${config.feeds.vessels}.`;
+    hint = `Retrying in ${f.retryMs / 1000} s. twin_app.py serves it at `
+      + `${feedBase()}${config.feeds.vessels}.`;
   } else if (f.state === "connecting") {
     state = "connecting";
     text = "connecting…";
@@ -606,11 +612,10 @@ async function start() {
   currentTab = null;
   showTab(tabs.includes(initial) ? initial : "live");
 
-  const port = config.feed_port;
-  feed(port, config.feeds.vessels, updateVessels, vesselFeedState);
+  feed(config.feeds.vessels, updateVessels, vesselFeedState);
   setInterval(renderVesselStatus, 15000);  // positions go stale without any new message
-  feed(port, config.feeds.tide, updateTide);
-  feed(port, config.feeds.storm_surge, updateStormSurge);
+  feed(config.feeds.tide, updateTide);
+  feed(config.feeds.storm_surge, updateStormSurge);
 }
 
 start();
