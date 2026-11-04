@@ -521,6 +521,28 @@ function viewHarbour3D() {
   });
 }
 
+const ZOOM_STEP = 1.5;  // each click scales the view by this factor
+
+function zoom(zoomIn) {
+  const camera = viewer.camera;
+  if (scene.mode === Cesium.SceneMode.SCENE2D) {
+    // In 2D the frustum size is the zoom level. Cesium halves the amount and applies it to the
+    // frustum's longer side, so pass the change in that side's full length.
+    const size = 2 * Math.max(Math.abs(camera.frustum.right), Math.abs(camera.frustum.top));
+    camera.zoomIn(zoomIn ? size * (1 - 1 / ZOOM_STEP) : -size * (ZOOM_STEP - 1));
+    return;
+  }
+  // In 3D move along the view direction, by a share of the distance to the ground ahead. The
+  // ellipsoid stands in for the ground (the harbour is near sea level): picking the terrain
+  // gives a different distance each click while its tiles stream in, so steps don't undo.
+  const ray = camera.getPickRay(new Cesium.Cartesian2(scene.canvas.clientWidth / 2,
+    scene.canvas.clientHeight / 2));
+  const hit = ray && Cesium.IntersectionTests.rayEllipsoid(ray, scene.globe.ellipsoid);
+  const distance = hit ? hit.start : camera.positionCartographic.height;
+  if (zoomIn) camera.zoomIn(distance * (1 - 1 / ZOOM_STEP));
+  else camera.zoomOut(distance * (ZOOM_STEP - 1));
+}
+
 function morph(mode, then) {
   if (scene.mode === mode) return then();
   const remove = scene.morphComplete.addEventListener(() => { remove(); then(); });
@@ -605,6 +627,8 @@ async function start() {
     showReplayDay(Number(e.target.value));
   });
   $("replay-play").addEventListener("click", () => togglePlay());
+  $("zoom-in").addEventListener("click", () => zoom(true));
+  $("zoom-out").addEventListener("click", () => zoom(false));
   $("water-slider").addEventListener("input", updateWater);
   $("water-reset").addEventListener("click", () => { $("water-slider").value = 0; updateWater(); });
 
