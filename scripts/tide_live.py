@@ -26,7 +26,7 @@ In the browser:
   };
 
 Run on its own, it listens on localhost; --host 0.0.0.0 serves other machines too
-(deploy/ runs it that way on ECS Fargate).
+(deploy/ runs twin_app.py, which serves this feed, that way on EC2).
 
 Needs duckdb and websockets (pip install duckdb websockets, and boto3 for S3).
 """
