@@ -1,11 +1,11 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
-  3d_port live data on AWS, all writing to or reading from S3: ais_consumer.py on
-  ECS Fargate (one task, always on) streaming aisstream.io positions, its
-  compact_handler on Lambda once a day, tide_consumer.py and storm_surge_consumer.py
-  as scheduled Lambda polls, and twin_app.py (the API and websocket feeds for the
-  page on Vercel) on EC2 behind CloudFront. Deployed by deploy/deploy.sh, which
-  builds and pushes ImageUri first.
+  3d_port live data on AWS, all writing to or reading from S3: twin_app.py (the API
+  and websocket feeds for the page on Vercel) and ais_consumer.py (streaming
+  aisstream.io positions, always on) on one EC2 instance, twin_app.py behind
+  CloudFront; ais_consumer's compact_handler on Lambda once a day; and
+  tide_consumer.py and storm_surge_consumer.py as scheduled Lambda polls. Deployed by
+  deploy/deploy.sh, which builds and pushes ImageUri first.
 
 Parameters:
   ImageUri:
@@ -30,12 +30,12 @@ Parameters:
     Type: String
     Description: >-
       ARN of the Secrets Manager secret holding the aisstream.io API key as plain
-      text (ECS takes a bare name for an SSM parameter instead)
+      text, read by the instance each time ais_consumer.py starts
   VpcId:
     Type: AWS::EC2::VPC::Id
   SubnetIds:
     Type: List<AWS::EC2::Subnet::Id>
-    Description: Public subnets; the tasks get public IPs to reach aisstream.io and S3
+    Description: Public subnets; the instance goes in the first
   CompactSchedule:
     Type: String
     Default: cron(30 0 * * ? *)
@@ -54,7 +54,7 @@ Conditions:
   IsUsEast1: !Equals [!Ref AWS::Region, us-east-1]
 
 Resources:
-  # S3 access shared by the consumer task and the compaction function
+  # S3 access shared by the consumer (on the twin instance) and the compaction function
   AisDataPolicy:
     Type: AWS::IAM::ManagedPolicy
     Properties:
@@ -111,101 +111,6 @@ Resources:
     Properties:
       LogGroupName: /3d-port/storm-surge
       RetentionInDays: 30
-
-  # --- Consumer: ECS Fargate ---
-
-  Cluster:
-    Type: AWS::ECS::Cluster
-    Properties:
-      ClusterName: 3d-port
-
-  ExecutionRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal: {Service: ecs-tasks.amazonaws.com}
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
-      Policies:
-        - PolicyName: read-api-key
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action: secretsmanager:GetSecretValue
-                Resource: !Ref ApiKeySecretArn
-
-  TaskRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal: {Service: ecs-tasks.amazonaws.com}
-            Action: sts:AssumeRole
-      ManagedPolicyArns: [!Ref AisDataPolicy]
-
-  TaskDefinition:
-    Type: AWS::ECS::TaskDefinition
-    Properties:
-      Family: 3d-port-ais-consumer
-      RequiresCompatibilities: [FARGATE]
-      NetworkMode: awsvpc
-      Cpu: "256"
-      Memory: "1024"
-      RuntimePlatform: {CpuArchitecture: X86_64, OperatingSystemFamily: LINUX}
-      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
-      TaskRoleArn: !GetAtt TaskRole.Arn
-      ContainerDefinitions:
-        - Name: ais-consumer
-          Image: !Ref ImageUri
-          EntryPoint: [python3, ais_consumer.py]
-          Essential: true
-          StopTimeout: 30   # SIGTERM flushes the buffer before exit
-          Environment:
-            - {Name: AIS_DIR, Value: !Sub "s3://${Bucket}/${AisPrefix}"}
-            - {Name: PYTHONUNBUFFERED, Value: "1"}
-          Secrets:
-            - {Name: AISSTREAM_API_KEY, ValueFrom: !Ref ApiKeySecretArn}
-          LogConfiguration:
-            LogDriver: awslogs
-            Options:
-              awslogs-group: !Ref LogGroup
-              awslogs-region: !Ref AWS::Region
-              awslogs-stream-prefix: consumer
-
-  SecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: AIS consumer, outbound only
-      VpcId: !Ref VpcId
-      SecurityGroupEgress:
-        - {IpProtocol: "-1", CidrIp: 0.0.0.0/0}
-
-  Service:
-    Type: AWS::ECS::Service
-    Properties:
-      ServiceName: ais-consumer
-      Cluster: !Ref Cluster
-      TaskDefinition: !Ref TaskDefinition
-      LaunchType: FARGATE
-      DesiredCount: 1
-      # Never two consumers at once (they would both rewrite vessels.parquet):
-      # a deploy stops the old task before starting the new one
-      DeploymentConfiguration:
-        MaximumPercent: 100
-        MinimumHealthyPercent: 0
-        DeploymentCircuitBreaker: {Enable: true, Rollback: true}
-      NetworkConfiguration:
-        AwsvpcConfiguration:
-          AssignPublicIp: ENABLED
-          Subnets: !Ref SubnetIds
-          SecurityGroups: [!Ref SecurityGroup]
 
   # --- Daily compaction: Lambda ---
 
@@ -383,6 +288,7 @@ Resources:
       ManagedPolicyArns:
         - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
         - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore   # Session Manager, send-command
+        - !Ref AisDataPolicy   # ais_consumer.py writes ais/
       Policies:
         - PolicyName: twin-app
           PolicyDocument:
@@ -391,7 +297,6 @@ Resources:
               - Effect: Allow
                 Action: s3:GetObject
                 Resource:
-                  - !Sub arn:${AWS::Partition}:s3:::${Bucket}/${AisPrefix}/*
                   - !Sub arn:${AWS::Partition}:s3:::${Bucket}/${TidePrefix}/*
                   - !Sub arn:${AWS::Partition}:s3:::${Bucket}/${FloodingPrefix}/*
               - Effect: Allow
@@ -401,8 +306,11 @@ Resources:
                 Action: ssm:GetParameter
                 Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TwinImageParameter}
               - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref ApiKeySecretArn
+              - Effect: Allow
                 Action: [logs:CreateLogStream, logs:PutLogEvents]
-                Resource: !GetAtt TwinLogGroup.Arn
+                Resource: [!GetAtt TwinLogGroup.Arn, !GetAtt LogGroup.Arn]
 
   TwinInstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -421,8 +329,11 @@ Resources:
       SecurityGroupEgress:
         - {IpProtocol: "-1", CidrIp: 0.0.0.0/0}
 
+  # Runs twin_app.py and ais_consumer.py, each in Docker under its own systemd unit.
   # A new Amazon Linux AMI replaces the instance on the next deploy, which is how it
-  # gets OS updates; the Elastic IP moves to the new one
+  # gets OS updates; the Elastic IP moves to the new one. Any other change to UserData
+  # stops and starts the instance, and the cloud-config part below makes the script run
+  # again on that boot (normally it runs on the first boot only), so keep it rerunnable.
   TwinInstance:
     Type: AWS::EC2::Instance
     Properties:
@@ -437,12 +348,28 @@ Resources:
       Tags: [{Key: Name, Value: 3d-port-twin}]
       UserData:
         Fn::Base64: !Sub |
+          Content-Type: multipart/mixed; boundary="==BOUNDARY=="
+          MIME-Version: 1.0
+
+          --==BOUNDARY==
+          Content-Type: text/cloud-config; charset="us-ascii"
+
+          cloud_final_modules:
+            - [scripts-user, always]
+
+          --==BOUNDARY==
+          Content-Type: text/x-shellscript; charset="us-ascii"
+
           #!/bin/bash
           set -euxo pipefail
           dnf install -y docker
           systemctl enable --now docker
 
-          cat > /etc/twin.env <<EOF
+          # Replace a file in one step, so a service already running it on a reboot
+          # keeps reading the old one: put PATH MODE <<EOF
+          put() { cat > "$1.new"; chmod "$2" "$1.new"; mv "$1.new" "$1"; }
+
+          put /etc/twin.env 644 <<EOF
           AIS_DIR=s3://${Bucket}/${AisPrefix}
           TIDE_DIR=s3://${Bucket}/${TidePrefix}
           FLOODING_DIR=s3://${Bucket}/${FloodingPrefix}
@@ -451,24 +378,53 @@ Resources:
           PYTHONUNBUFFERED=1
           EOF
 
-          # Pull the image named in the parameter and run it in the foreground
-          cat > /usr/local/bin/twin-start <<'EOF'
+          put /etc/ais-consumer.env 644 <<EOF
+          AIS_DIR=s3://${Bucket}/${AisPrefix}
+          AWS_REGION=${AWS::Region}
+          PYTHONUNBUFFERED=1
+          EOF
+
+          # port-run NAME ENV_FILE LOG_GROUP SCRIPT [ARGS...]: pull the image named in
+          # the parameter and run python3 SCRIPT in it, in the foreground, as container
+          # NAME logging to LOG_GROUP. Passes AISSTREAM_API_KEY through when it's set.
+          put /usr/local/bin/port-run 755 <<'EOF'
           #!/bin/bash
           set -euo pipefail
+          name=$1 env_file=$2 log_group=$3
+          shift 3
           export AWS_REGION=${AWS::Region}
           image=$(aws ssm get-parameter --name ${TwinImageParameter} --query Parameter.Value --output text)
           aws ecr get-login-password | docker login --username AWS --password-stdin "${!image%%/*}"
           docker pull "$image"
-          docker rm -f twin 2>/dev/null || true
-          docker image prune -af
-          exec docker run --name twin --network host --env-file /etc/twin.env \
-            --log-driver awslogs --log-opt awslogs-group=${TwinLogGroup} \
-            --log-opt awslogs-region=${AWS::Region} --log-opt awslogs-stream=twin-app \
-            --entrypoint python3 "$image" twin_app.py --host 0.0.0.0 --port 8000 --feed-port 8001
+          docker rm -f "$name" 2>/dev/null || true
+          # Remove the other images, except any the other container is still running
+          keep=$(docker image inspect --format '{{.Id}}' "$image")
+          docker images --quiet --no-trunc | sort -u | grep -vxF "$keep" | xargs -r docker rmi 2>/dev/null || true
+          exec docker run --name "$name" --network host --env-file "$env_file" \
+            ${!AISSTREAM_API_KEY:+--env AISSTREAM_API_KEY} --stop-timeout 30 \
+            --log-driver awslogs --log-opt awslogs-group="$log_group" \
+            --log-opt awslogs-region=${AWS::Region} --log-opt awslogs-stream="$name" \
+            --entrypoint python3 "$image" "$@"
           EOF
-          chmod +x /usr/local/bin/twin-start
 
-          cat > /etc/systemd/system/twin.service <<'EOF'
+          put /usr/local/bin/twin-start 755 <<'EOF'
+          #!/bin/bash
+          exec /usr/local/bin/port-run twin /etc/twin.env ${TwinLogGroup} \
+            twin_app.py --host 0.0.0.0 --port 8000 --feed-port 8001
+          EOF
+
+          # The API key is read on each start, so a new one in Secrets Manager only needs
+          # a restart
+          put /usr/local/bin/ais-consumer-start 755 <<'EOF'
+          #!/bin/bash
+          set -euo pipefail
+          AISSTREAM_API_KEY=$(aws secretsmanager get-secret-value --region ${AWS::Region} \
+            --secret-id ${ApiKeySecretArn} --query SecretString --output text)
+          export AISSTREAM_API_KEY
+          exec /usr/local/bin/port-run ais-consumer /etc/ais-consumer.env ${LogGroup} ais_consumer.py
+          EOF
+
+          put /etc/systemd/system/twin.service 644 <<'EOF'
           [Unit]
           Description=twin_app.py
           After=docker.service network-online.target
@@ -484,8 +440,33 @@ Resources:
           [Install]
           WantedBy=multi-user.target
           EOF
+
+          # Never two consumers at once (they would both rewrite vessels.parquet):
+          # deploy.sh stops this one before a deploy that could replace the instance.
+          # SIGTERM flushes the buffer before exit, given up to 30 seconds.
+          put /etc/systemd/system/ais-consumer.service 644 <<'EOF'
+          [Unit]
+          Description=ais_consumer.py
+          After=docker.service network-online.target
+          Requires=docker.service
+          Wants=network-online.target
+
+          [Service]
+          ExecStart=/usr/local/bin/ais-consumer-start
+          ExecStop=/usr/bin/docker stop -t 30 ais-consumer
+          Restart=always
+          RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
           systemctl daemon-reload
-          systemctl enable --now twin
+          systemctl enable twin ais-consumer
+          # Restart rather than start: on a later boot they're already running the
+          # previous versions of the files above
+          systemctl restart twin ais-consumer
+          --==BOUNDARY==--
 
   TwinIp:
     Type: AWS::EC2::EIP

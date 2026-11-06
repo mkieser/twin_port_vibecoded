@@ -38,7 +38,7 @@ with compact_handler.
 
 AIS_DIR is DATA_DIR/ais, or an S3 prefix such as s3://kieser-public/ais when the
 AIS_DIR environment variable says so (see storage.py). deploy/ runs the consumer
-on ECS Fargate and compact_handler daily on Lambda, both writing to S3.
+on EC2, beside twin_app.py, and compact_handler daily on Lambda, both writing to S3.
 
 Needs an aisstream.io API key in AISSTREAM_API_KEY, plus duckdb and websockets
 (pip install duckdb websockets, and boto3 for S3). Stop with Ctrl+C or SIGTERM;

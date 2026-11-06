@@ -1,5 +1,5 @@
-# One image for everything in template.yaml: the AIS consumer on ECS Fargate and
-# twin_app.py on EC2 (entry points set there), and compact_handler (this image's
+# One image for everything in template.yaml: the AIS consumer and twin_app.py on
+# EC2 (entry points set there), and compact_handler (this image's
 # default) and the tide and storm surge poll_handlers on Lambda.
 # Build from the repository root: docker build -f deploy/Dockerfile .
 FROM public.ecr.aws/lambda/python:3.14

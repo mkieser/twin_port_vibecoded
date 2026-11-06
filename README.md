@@ -49,8 +49,8 @@ scripts/
   twin_app/                     the app: index.html, app.js, style.css (vercel.json from deploy.sh)
   test_*.py                     unit tests (python -m unittest)
 deploy/
-  Dockerfile                    one image for the consumers and the twin app (ECS, Lambda, EC2)
-  template.yaml                 CloudFormation: Fargate, Lambdas, the EC2 twin app, CloudFront
+  Dockerfile                    one image for the consumers and the twin app (EC2, Lambda)
+  template.yaml                 CloudFormation: the EC2 instance, Lambdas, CloudFront
   deploy.sh                     build, push to ECR and deploy the stack
 ```
 
@@ -140,7 +140,7 @@ AWS_PROFILE=personal AIS_DIR=s3://kieser-public/ais TIDE_DIR=s3://kieser-public/
 
 | What | Where | Data |
 |---|---|---|
-| `ais_consumer.py` | ECS Fargate, one task, always on | `ais/` |
+| `ais_consumer.py` | the same EC2 instance as `twin_app.py`, always on | `ais/` |
 | `ais_consumer.compact_handler` | Lambda, daily at 00:30 UTC | `ais/` |
 | `tide_consumer.poll_handler` | Lambda, every 5 minutes | `tide/` |
 | `storm_surge_consumer.poll_handler` | Lambda, every 30 minutes | `coastal_flooding/` |
@@ -163,14 +163,17 @@ The script builds the image, pushes it to ECR and deploys the CloudFormation sta
 default; otherwise set `VPC_ID` and `SUBNET_IDS`). Run it again after changing the code.
 Logs are in the `/3d-port/ais`, `/3d-port/tide`, `/3d-port/storm-surge` and `/3d-port/twin` log
 groups. A
-deploy stops the old AIS task before starting the new one, so two consumers never write at
-once; positions are missed for about a minute. Stop any local consumers writing to the same
-S3 prefixes.
+deploy stops the AIS consumer before deploying the stack and starts it again after, so two
+consumers never write at once, even when the deploy replaces the instance; positions are
+missed for the length of the deploy, usually a few minutes. Stop any local consumers writing
+to the same S3 prefixes.
 
 **The twin app.** Vercel serves the page but can't run `twin_app.py` or forward
 websockets, so:
 - **The app:** `twin_app.py` runs in Docker on an EC2 instance with an Elastic IP, started by a
   systemd unit (`twin`) that pulls the image named in the SSM parameter `/3d-port/twin-image`.
+  `ais_consumer.py` runs beside it the same way, under the unit `ais-consumer`, reading the
+  aisstream.io key from Secrets Manager each time it starts.
 - **CloudFront:** a distribution in front of it gives `https://` and `wss://` without a domain
   of our own. It forwards the feed paths to port 8001 and everything else to 8000. The
   instance accepts connections only from CloudFront.
@@ -183,9 +186,10 @@ The script ends by printing the CloudFront URL, which also serves the whole app 
 writes `vercel.json` with that URL; commit and push it so Vercel redeploys the page with the
 rewrite. This assumes the Vercel project's root directory is `scripts/twin_app`.
 
-After the first deploy, the script restarts `twin_app.py` on the new image through SSM Run
-Command. A newer Amazon Linux AMI replaces the instance on the next deploy, which is how it
-gets OS updates; the app is down for a few minutes then. For a shell on the instance, run
+After the first deploy, the script restarts `twin_app.py` and `ais_consumer.py` on the new
+image through SSM Run Command. A newer Amazon Linux AMI replaces the instance on the next
+deploy, which is how it gets OS updates; the app is down for a few minutes then. A change to
+the instance's UserData in `template.yaml` restarts it instead, rerunning the script. For a shell on the instance, run
 `aws ssm start-session --target <instance id>`; it has no SSH key.
 
 Behind HTTPS elsewhere, put a TLS proxy (nginx, Caddy and so on) in front of both ports,
